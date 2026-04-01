@@ -40,10 +40,10 @@ print(f"Webcam: {width}x{height} @ {fps}fps")
 # ========== REAL-TIME SMOOTHING SETUP ==========
 # Changed: Use exponential moving average for real-time smoothing
 # This only uses past data, no future frames needed
-SMOOTHING_FACTOR = 1.0  # Higher = more smoothing (0.0 to 1.0)
+# SMOOTHING_FACTOR = 1.0  # Higher = more smoothing (0.0 to 1.0)
 
 # if less than this many features found, skip stabilization for that frame
-MIN_FEATURES = 10
+MIN_FEATURES = 5
 
 # Changed: Initialize trajectory tracking variables
 # These will accumulate over time as we process frames
@@ -56,8 +56,9 @@ prev_transform = np.zeros(3)  # Previous frame's transformation
 # This adds slight latency but gives better smoothing
  # Number of frames to buffer (lower = less latency) (fps/2 = 1/5 second looking
  # into future
-BUFFER_SIZE = 30
+BUFFER_SIZE = 24
 transform_buffer = deque(maxlen=BUFFER_SIZE)
+frame_buffer = deque(maxlen=BUFFER_SIZE) 
 trajectory = np.zeros(3)
 
 # ========== INITIALIZATION ==========
@@ -87,6 +88,8 @@ while True: #process forever
     if not success:
         print("Failed to read frame")
         break
+
+    frame_buffer.append(curr_frame.copy())
     
     # Convert current frame to grayscale
     curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
@@ -126,7 +129,7 @@ while True: #process forever
         # ========== MOTION ESTIMATION ==========
         # Estimate the transformation between frames. otherwise, skip
         if len(prev_points) >= 3:  # Need at least 3 points
-            matrix, _ = cv2.estimateAffine2D(prev_points, curr_points)
+            matrix, _ = cv2.estimateAffinePartial2D(prev_points, curr_points)
             
             if matrix is not None:
                 # Extract transformation parameters
@@ -152,13 +155,22 @@ while True: #process forever
     # Only apply stabilization once buffer is full (after ~0.5 sec delay)
     if len(transform_buffer) == BUFFER_SIZE:
         # Average all transforms in the buffer (like the static version's moving average)
-        smoothed_trajectory = trajectory - np.mean(transform_buffer, axis=0) * len(transform_buffer)
+        # Get the OLDEST frame from buffer (the first one added)
+        frame_to_stabilize = list(frame_buffer)[0]
         
-        # Calculate the correction needed
-        difference = smoothed_trajectory - trajectory
+        # Now we have BUFFER_SIZE frames of future motion data
+        # Smooth the entire trajectory buffer (not just averaging transforms)
+        trajectory_array = np.array(transform_buffer)
         
-        # Apply correction to current transformation
-        transform_smooth = current_transform + difference
+        # Calculate what the trajectory would be at each point in buffer
+        cumulative_trajectory = np.cumsum(trajectory_array, axis=0)
+        
+        # Average across all future trajectories to smooth
+        smoothed_value = np.mean(cumulative_trajectory, axis=0)
+        
+        # The correction for the oldest frame
+        difference = smoothed_value - cumulative_trajectory[0]
+        transform_smooth = trajectory_array[0] + difference
         
         
         # ========== APPLY STABILIZATION ==========
@@ -177,17 +189,21 @@ while True: #process forever
         transformation_matrix[1, 2] = translation_y
         
         # Apply the transformation to stabilize the frame
+        # Apply to the OLDEST frame
         frame_stabilized = cv2.warpAffine(
-            curr_frame,
+            frame_to_stabilize,
             transformation_matrix,
             (width, height)
         )
         
         # Fix borders by slightly zooming in
-        frame_stabilized = fix_border(frame_stabilized)
+        rame_stabilized = fix_border(frame_stabilized)
+
+        #apply to frame to stabilize
+        frame_to_stabilize = fix_border(frame_to_stabilize)
         
         # Create side-by-side comparison
-        frame_out = cv2.hconcat([curr_frame, frame_stabilized])
+        frame_out = cv2.hconcat([frame_to_stabilize, frame_stabilized])
         
         # Store current transform for next iteration
         prev_transform = current_transform
