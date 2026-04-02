@@ -197,7 +197,7 @@ while True: #process forever
         )
         
         # Fix borders by slightly zooming in
-        rame_stabilized = fix_border(frame_stabilized)
+        frame_stabilized = fix_border(frame_stabilized)
 
         #apply to frame to stabilize
         frame_to_stabilize = fix_border(frame_to_stabilize)
