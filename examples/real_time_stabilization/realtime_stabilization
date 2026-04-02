@@ -17,7 +17,7 @@ def fix_border(frame):
     matrix = cv2.getRotationMatrix2D(
         (frame_shape[1] / 2, frame_shape[0] / 2),
         0,
-        1.2
+        1.1
     )
     
     frame = cv2.warpAffine(frame, matrix, (frame_shape[1], frame_shape[0]))
@@ -40,10 +40,10 @@ print(f"Webcam: {width}x{height} @ {fps}fps")
 # ========== REAL-TIME SMOOTHING SETUP ==========
 # Changed: Use exponential moving average for real-time smoothing
 # This only uses past data, no future frames needed
-SMOOTHING_FACTOR = 1.0  # Higher = more smoothing (0.0 to 1.0)
+# SMOOTHING_FACTOR = 1.0  # Higher = more smoothing (0.0 to 1.0)
 
 # if less than this many features found, skip stabilization for that frame
-MIN_FEATURES = 10
+MIN_FEATURES = 20
 
 # Changed: Initialize trajectory tracking variables
 # These will accumulate over time as we process frames
@@ -56,8 +56,9 @@ prev_transform = np.zeros(3)  # Previous frame's transformation
 # This adds slight latency but gives better smoothing
  # Number of frames to buffer (lower = less latency) (fps/2 = 1/5 second looking
  # into future
-BUFFER_SIZE = 30
+BUFFER_SIZE = 24
 transform_buffer = deque(maxlen=BUFFER_SIZE)
+frame_buffer = deque(maxlen=BUFFER_SIZE) 
 trajectory = np.zeros(3)
 
 # ========== INITIALIZATION ==========
@@ -87,6 +88,8 @@ while True: #process forever
     if not success:
         print("Failed to read frame")
         break
+
+    frame_buffer.append(curr_frame.copy())
     
     # Convert current frame to grayscale
     curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
@@ -126,7 +129,7 @@ while True: #process forever
         # ========== MOTION ESTIMATION ==========
         # Estimate the transformation between frames. otherwise, skip
         if len(prev_points) >= 3:  # Need at least 3 points
-            matrix, _ = cv2.estimateAffine2D(prev_points, curr_points)
+            matrix, _ = cv2.estimateAffinePartial2D(prev_points, curr_points)
             
             if matrix is not None:
                 # Extract transformation parameters
@@ -152,13 +155,25 @@ while True: #process forever
     # Only apply stabilization once buffer is full (after ~0.5 sec delay)
     if len(transform_buffer) == BUFFER_SIZE:
         # Average all transforms in the buffer (like the static version's moving average)
-        smoothed_trajectory = trajectory - np.mean(transform_buffer, axis=0) * len(transform_buffer)
+        # Get the OLDEST frame from buffer (the first one added)
+        center_idx = BUFFER_SIZE // 2
+        frame_to_stabilize = list(frame_buffer)[center_idx]
         
-        # Calculate the correction needed
-        difference = smoothed_trajectory - trajectory
-        
-        # Apply correction to current transformation
-        transform_smooth = current_transform + difference
+        # Now we have BUFFER_SIZE frames of future motion data
+        # Smooth the entire trajectory buffer (not just averaging transforms)
+        trajectory_array = np.array(transform_buffer)
+
+        # Calculate trajectory across the buffered frames
+        cumulative_trajectory = np.cumsum(trajectory_array, axis=0)
+
+        # Smooth the buffered trajectory like in the offline version
+        smoothed_trajectory = np.copy(cumulative_trajectory)
+        for j in range(3):
+            smoothed_trajectory[:, j] = calculate_moving_average(cumulative_trajectory[:, j], radius=3)
+
+        # Correction for the oldest frame in the buffer
+        difference = smoothed_trajectory[center_idx] - cumulative_trajectory[center_idx]        
+        transform_smooth = trajectory_array[center_idx] + difference
         
         
         # ========== APPLY STABILIZATION ==========
@@ -177,18 +192,23 @@ while True: #process forever
         transformation_matrix[1, 2] = translation_y
         
         # Apply the transformation to stabilize the frame
+        # Apply to the OLDEST frame
         frame_stabilized = cv2.warpAffine(
-            curr_frame,
+            frame_to_stabilize,
             transformation_matrix,
             (width, height)
         )
         
         # Fix borders by slightly zooming in
         frame_stabilized = fix_border(frame_stabilized)
+
+        #apply to frame to stabilize
+        frame_to_stabilize = fix_border(frame_to_stabilize)
         
         # Create side-by-side comparison
-        frame_out = cv2.hconcat([curr_frame, frame_stabilized])
-        
+        frame_out = cv2.hconcat([frame_to_stabilize, frame_stabilized])
+        frame_buffer.popleft()
+
         # Store current transform for next iteration
         prev_transform = current_transform
 
@@ -225,7 +245,6 @@ while True: #process forever
     # Check for quit key ('q')
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
-
 
 # ========== CLEANUP ==========
 # Release resources
