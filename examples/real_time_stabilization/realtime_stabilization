@@ -17,7 +17,7 @@ def fix_border(frame):
     matrix = cv2.getRotationMatrix2D(
         (frame_shape[1] / 2, frame_shape[0] / 2),
         0,
-        1.2
+        1.1
     )
     
     frame = cv2.warpAffine(frame, matrix, (frame_shape[1], frame_shape[0]))
@@ -43,7 +43,7 @@ print(f"Webcam: {width}x{height} @ {fps}fps")
 # SMOOTHING_FACTOR = 1.0  # Higher = more smoothing (0.0 to 1.0)
 
 # if less than this many features found, skip stabilization for that frame
-MIN_FEATURES = 5
+MIN_FEATURES = 20
 
 # Changed: Initialize trajectory tracking variables
 # These will accumulate over time as we process frames
@@ -156,21 +156,24 @@ while True: #process forever
     if len(transform_buffer) == BUFFER_SIZE:
         # Average all transforms in the buffer (like the static version's moving average)
         # Get the OLDEST frame from buffer (the first one added)
-        frame_to_stabilize = list(frame_buffer)[0]
+        center_idx = BUFFER_SIZE // 2
+        frame_to_stabilize = list(frame_buffer)[center_idx]
         
         # Now we have BUFFER_SIZE frames of future motion data
         # Smooth the entire trajectory buffer (not just averaging transforms)
         trajectory_array = np.array(transform_buffer)
-        
-        # Calculate what the trajectory would be at each point in buffer
+
+        # Calculate trajectory across the buffered frames
         cumulative_trajectory = np.cumsum(trajectory_array, axis=0)
-        
-        # Average across all future trajectories to smooth
-        smoothed_value = np.mean(cumulative_trajectory, axis=0)
-        
-        # The correction for the oldest frame
-        difference = smoothed_value - cumulative_trajectory[0]
-        transform_smooth = trajectory_array[0] + difference
+
+        # Smooth the buffered trajectory like in the offline version
+        smoothed_trajectory = np.copy(cumulative_trajectory)
+        for j in range(3):
+            smoothed_trajectory[:, j] = calculate_moving_average(cumulative_trajectory[:, j], radius=3)
+
+        # Correction for the oldest frame in the buffer
+        difference = smoothed_trajectory[center_idx] - cumulative_trajectory[center_idx]        
+        transform_smooth = trajectory_array[center_idx] + difference
         
         
         # ========== APPLY STABILIZATION ==========
@@ -197,14 +200,15 @@ while True: #process forever
         )
         
         # Fix borders by slightly zooming in
-        rame_stabilized = fix_border(frame_stabilized)
+        frame_stabilized = fix_border(frame_stabilized)
 
         #apply to frame to stabilize
         frame_to_stabilize = fix_border(frame_to_stabilize)
         
         # Create side-by-side comparison
         frame_out = cv2.hconcat([frame_to_stabilize, frame_stabilized])
-        
+        frame_buffer.popleft()
+
         # Store current transform for next iteration
         prev_transform = current_transform
 
@@ -241,7 +245,6 @@ while True: #process forever
     # Check for quit key ('q')
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
-
 
 # ========== CLEANUP ==========
 # Release resources
