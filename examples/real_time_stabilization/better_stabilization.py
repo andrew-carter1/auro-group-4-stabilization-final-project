@@ -13,7 +13,7 @@ def fix_border(frame):
     return cv2.warpAffine(frame, matrix, (frame_shape[1], frame_shape[0]))
 
 # ========== CONFIGURATION ==========
-cap = cv2.VideoCapture(1)
+cap = cv2.VideoCapture(0)
 
 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -21,7 +21,7 @@ fps = cap.get(cv2.CAP_PROP_FPS)
 
 # Higher ALPHA = follows movement faster (less stable)
 # Lower ALPHA = smoother (more stable, but might see more black borders)
-ALPHA = 0.1
+ALPHA = 0.05
 MIN_FEATURES = 20
 
 # Trajectory tracking

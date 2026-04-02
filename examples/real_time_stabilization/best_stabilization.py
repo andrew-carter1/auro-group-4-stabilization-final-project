@@ -3,12 +3,12 @@ import cv2
 from collections import deque
 
 # ========== CONFIGURATION ==========
-BUFFER_SIZE = 11  # Must be odd. ~0.8s delay at 30fps.
+BUFFER_SIZE = 7 # Must be odd. ~0.8s delay at 30fps.
 SIGMA = 8         # Strength of smoothing.
 CROP_FACTOR = 1.1 # Zoom to hide edges.
 # ===================================
 
-cap = cv2.VideoCapture(1)
+cap = cv2.VideoCapture(0)
 width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
