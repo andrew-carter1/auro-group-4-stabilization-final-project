@@ -1,15 +1,22 @@
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image, CompressedImage
+from sensor_msgs.msg import CompressedImage
 from cv_bridge import CvBridge
 import cv2
 import os
 import numpy as np
+from ament_index_python.packages import get_package_share_directory
 
 class ImageProcessor(Node):
     def __init__(self):
         super().__init__('face_detection_node')
-        model_path = os.path.expanduser('~/haarcascade_frontalface_default.xml')
+
+        model_path = os.path.join(
+            get_package_share_directory('stabilization_pkg'),
+            'models',
+            'haarcascade_frontalface_default.xml'
+        )
+
         self.faceCascade = cv2.CascadeClassifier(model_path)
         self.bridge = CvBridge()
 
@@ -20,6 +27,7 @@ class ImageProcessor(Node):
         # Publisher: Send image with faces drawn (compressed)
         self.publisher = self.create_publisher(CompressedImage, '/image_with_faces/compressed', 10)
         self.get_logger().info("Face Detection Node Started")
+        self.get_logger().info(f"Loading model from: {model_path}")
 
     def listener_callback(self, data):
         # Decode compressed image
