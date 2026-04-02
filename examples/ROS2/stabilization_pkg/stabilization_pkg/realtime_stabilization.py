@@ -8,7 +8,6 @@ from sensor_msgs.msg import CompressedImage
 def fix_border(frame):
     """Slightly zooms and crops to hide black edges from stabilization."""
     frame_shape = frame.shape
-    # zooms in by factor of 1.1
     matrix = cv2.getRotationMatrix2D(
         (frame_shape[1] / 2, frame_shape[0] / 2),
         0,
@@ -50,6 +49,9 @@ class StabilizationNode(Node):
 
         self.frame_count = 0
 
+        # Shake graph history
+        self.shake_history = deque(maxlen=100)
+
         # ========== INITIALIZATION ==========
         # Read the first frame
         success, prev_frame = self.cap.read()
@@ -71,17 +73,16 @@ class StabilizationNode(Node):
         graph_h, graph_w = 80, frame_out.shape[1]
         graph = np.zeros((graph_h, graph_w, 3), dtype=np.uint8)
 
-        # Draw x shake (blue), y shake (green)
         for i in range(1, len(history)):
             x1 = int((i - 1) / max_points * graph_w)
             x2 = int(i / max_points * graph_w)
 
-            # X shake
+            # X shake (blue)
             y1 = int(graph_h / 2 - history[i-1][0])
             y2 = int(graph_h / 2 - history[i][0])
             cv2.line(graph, (x1, y1), (x2, y2), (255, 0, 0), 1)
 
-            # Y shake
+            # Y shake (green)
             y1 = int(graph_h / 2 - history[i-1][1])
             y2 = int(graph_h / 2 - history[i][1])
             cv2.line(graph, (x1, y1), (x2, y2), (0, 255, 0), 1)
@@ -185,6 +186,10 @@ class StabilizationNode(Node):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         cv2.putText(frame_out, "Stabilized", (self.width + 10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+        # Draw shake graph below video
+        self.shake_history.append(current_transform)
+        frame_out = self.draw_shake_graph(frame_out, list(self.shake_history))
 
         cv2.imshow("Real-time EMA Stabilization", frame_out)
         cv2.waitKey(1)
