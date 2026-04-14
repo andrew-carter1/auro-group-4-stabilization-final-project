@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""
+Storm BCG Gimbal ROS2 Node
+Reads roll/pitch/yaw from the gimbal over serial and publishes to /gimbal/angles.
+
+Topic: /gimbal/angles (geometry_msgs/Vector3Stamped)
+  x = roll  (degrees)
+  y = pitch (degrees)
+  z = yaw   (degrees, continuous)
+
+Parameters:
+  port     (string) -- serial port, default '/dev/ttyACM0'
+  baudrate (int)    -- baud rate,   default 115200
+"""
+
+import struct
+
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Vector3Stamped
+
+import serial
+
+
+class GimbalNode(Node):
+    HEADER = 0x3E
+    CMD_REALTIME_DATA = 0x44
+
+    # Timeout short enough to keep up with 30 Hz (33 ms per cycle).
+    # At 115200 baud a ~68-byte response takes ~5 ms, so 25 ms leaves margin.
+    # To run at 60 Hz: change to 0.015 (15 ms timeout)
+    SERIAL_TIMEOUT = 0.025
+
+    def __init__(self):
+        super().__init__('gimbal_node')
+
+        self.declare_parameter('port', '/dev/ttyACM0')
+        self.declare_parameter('baudrate', 115200)
+
+        port = self.get_parameter('port').get_parameter_value().string_value
+        baudrate = self.get_parameter('baudrate').get_parameter_value().integer_value
+
+        self.pub = self.create_publisher(Vector3Stamped, '/gimbal/angles', 10)
+
+        self.ser = serial.Serial(
+            port=port,
+            baudrate=baudrate,
+            timeout=self.SERIAL_TIMEOUT,
+            dsrdtr=True
+        )
+        # Let the gimbal finish initializing before we start polling
+        import time; time.sleep(2)
+        self.get_logger().info(f'Connected to gimbal on {port}')
+
+        # To run at 60 Hz: change divisor to 60.0 (and SERIAL_TIMEOUT to 0.015)
+        self.create_timer(1.0 / 30.0, self.timer_cb)
+
+    def _build_packet(self, cmd: int) -> bytes:
+        size = 0
+        header_crc = (cmd + size) & 0xFF
+        return bytes([self.HEADER, cmd, size, header_crc, 0])
+
+    def _read_gimbal(self) -> dict:
+        # Discard any queued bytes from a previous cycle so we always parse
+        # the freshest response, not a stale one that arrived late.
+        self.ser.reset_input_buffer()
+        self.ser.write(self._build_packet(self.CMD_REALTIME_DATA))
+
+        # Read the 4-byte header first to discover payload size.
+        header = self.ser.read(4)
+        if len(header) < 4 or header[0] != self.HEADER:
+            return None
+
+        size = header[2]
+
+        # Read payload + trailing data CRC byte.
+        rest = self.ser.read(size + 1)
+        if len(rest) < size:
+            return None
+
+        payload = rest[:size]
+
+        if len(payload) < 44:
+            return None
+
+        roll_raw  = struct.unpack('<h', payload[0:2])[0]
+        pitch_raw = struct.unpack('<h', payload[6:8])[0]
+        yaw_raw   = struct.unpack('<h', payload[42:44])[0]
+
+        return {
+            'roll_deg':  roll_raw  * 0.18,
+            'pitch_deg': pitch_raw * 0.18,
+            'yaw_deg':   yaw_raw   * 0.1,
+        }
+
+    def timer_cb(self):
+        data = self._read_gimbal()
+        if data is None:
+            self.get_logger().warn('No data from gimbal', throttle_duration_sec=1.0)
+            return
+
+        msg = Vector3Stamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'gimbal'
+        msg.vector.x = data['roll_deg']
+        msg.vector.y = data['pitch_deg']
+        msg.vector.z = data['yaw_deg']
+        self.pub.publish(msg)
+
+    def destroy_node(self):
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+        super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = GimbalNode()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
