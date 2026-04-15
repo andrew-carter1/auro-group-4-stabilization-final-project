@@ -1,12 +1,25 @@
 #!/usr/bin/env python3
 """
 Storm BCG Gimbal ROS2 Node
-Reads roll/pitch/yaw from the gimbal over serial and publishes to /gimbal/angles.
+Reads roll/pitch/yaw and gyro rates from the gimbal over serial.
 
-Topic: /gimbal/angles (geometry_msgs/Vector3Stamped)
-  x = roll  (degrees)
-  y = pitch (degrees)
-  z = yaw   (degrees, continuous)
+Topics published:
+  /gimbal/angles  (geometry_msgs/Vector3Stamped)
+    x = roll  (degrees, 1 decimal place)
+    y = pitch (degrees, 1 decimal place)
+    z = yaw   (degrees, continuous — see note below)
+
+  /gimbal/gyro  (geometry_msgs/Vector3Stamped)
+    x = roll  angular velocity (raw units — unit type not yet determined)
+    y = pitch angular velocity (raw units — unit type not yet determined)
+    z = 0     (gimbal does not output yaw gyro in CMD_REALTIME_DATA)
+
+NOTE — Yaw accumulation:
+  Yaw is reported as a continuous value and does NOT wrap at ±360°.
+  Rotating clockwise continuously will increment past +360°, +720°, etc.
+  Counter-clockwise goes past -360°, -720°, etc.
+  Consumers must handle this if a bounded [-180°, +180°) or [0°, 360°)
+  representation is needed (use modulo arithmetic).
 
 Parameters:
   port     (string) -- serial port, default '/dev/ttyACM0'
@@ -40,7 +53,8 @@ class GimbalNode(Node):
         port = self.get_parameter('port').get_parameter_value().string_value
         baudrate = self.get_parameter('baudrate').get_parameter_value().integer_value
 
-        self.pub = self.create_publisher(Vector3Stamped, '/gimbal/angles', 10)
+        self.pub_angles = self.create_publisher(Vector3Stamped, '/gimbal/angles', 10)
+        self.pub_gyro   = self.create_publisher(Vector3Stamped, '/gimbal/gyro',   10)
 
         self.ser = serial.Serial(
             port=port,
@@ -83,14 +97,21 @@ class GimbalNode(Node):
         if len(payload) < 44:
             return None
 
-        roll_raw  = struct.unpack('<h', payload[0:2])[0]
-        pitch_raw = struct.unpack('<h', payload[6:8])[0]
-        yaw_raw   = struct.unpack('<h', payload[42:44])[0]
+        # Byte offsets validated experimentally (see examples/gimbal_communication/SETUP.md)
+        roll_raw       = struct.unpack('<h', payload[0:2])[0]
+        roll_gyro_raw  = struct.unpack('<h', payload[2:4])[0]   # raw — units TBD
+        pitch_raw      = struct.unpack('<h', payload[6:8])[0]
+        pitch_gyro_raw = struct.unpack('<h', payload[8:10])[0]  # raw — units TBD
+        yaw_raw        = struct.unpack('<h', payload[42:44])[0]
 
         return {
-            'roll_deg':  roll_raw  * 0.18,
-            'pitch_deg': pitch_raw * 0.18,
-            'yaw_deg':   yaw_raw   * 0.1,
+            # Roll/pitch rounded to 1 decimal — sub-0.1° is noise at 0.18°/unit resolution
+            'roll_deg':       round(roll_raw  * 0.18, 1),
+            'pitch_deg':      round(pitch_raw * 0.18, 1),
+            # Yaw: full resolution (0.1°/unit), continuous, NOT wrapped — see docstring
+            'yaw_deg':        yaw_raw * 0.1,
+            'roll_gyro_raw':  roll_gyro_raw,
+            'pitch_gyro_raw': pitch_gyro_raw,
         }
 
     def timer_cb(self):
@@ -99,13 +120,23 @@ class GimbalNode(Node):
             self.get_logger().warn('No data from gimbal', throttle_duration_sec=1.0)
             return
 
-        msg = Vector3Stamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'gimbal'
-        msg.vector.x = data['roll_deg']
-        msg.vector.y = data['pitch_deg']
-        msg.vector.z = data['yaw_deg']
-        self.pub.publish(msg)
+        now = self.get_clock().now().to_msg()
+
+        angles_msg = Vector3Stamped()
+        angles_msg.header.stamp    = now
+        angles_msg.header.frame_id = 'gimbal'
+        angles_msg.vector.x = data['roll_deg']
+        angles_msg.vector.y = data['pitch_deg']
+        angles_msg.vector.z = data['yaw_deg']
+        self.pub_angles.publish(angles_msg)
+
+        gyro_msg = Vector3Stamped()
+        gyro_msg.header.stamp    = now
+        gyro_msg.header.frame_id = 'gimbal'
+        gyro_msg.vector.x = float(data['roll_gyro_raw'])
+        gyro_msg.vector.y = float(data['pitch_gyro_raw'])
+        gyro_msg.vector.z = 0.0  # yaw gyro not available in this packet
+        self.pub_gyro.publish(gyro_msg)
 
     def destroy_node(self):
         if self.ser and self.ser.is_open:
