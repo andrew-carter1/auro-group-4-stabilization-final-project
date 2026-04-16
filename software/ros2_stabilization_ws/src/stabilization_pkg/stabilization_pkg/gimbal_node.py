@@ -56,18 +56,38 @@ class GimbalNode(Node):
         self.pub_angles = self.create_publisher(Vector3Stamped, '/gimbal/angles', 10)
         self.pub_gyro   = self.create_publisher(Vector3Stamped, '/gimbal/gyro',   10)
 
-        self.ser = serial.Serial(
-            port=port,
-            baudrate=baudrate,
-            timeout=self.SERIAL_TIMEOUT,
-            dsrdtr=True
-        )
-        # Let the gimbal finish initializing before we start polling
-        import time; time.sleep(2)
-        self.get_logger().info(f'Connected to gimbal on {port}')
+        self._port     = port
+        self._baudrate = baudrate
+        self.ser       = None
+        self._connect()
 
         # To run at 60 Hz: change divisor to 60.0 (and SERIAL_TIMEOUT to 0.015)
         self.create_timer(1.0 / 30.0, self.timer_cb)
+
+    def _connect(self) -> bool:
+        """
+        Attempt to open the serial port. Returns True on success.
+        Safe to call repeatedly — closes any existing connection first.
+        """
+        if self.ser and self.ser.is_open:
+            return True
+        try:
+            self.ser = serial.Serial(
+                port=self._port,
+                baudrate=self._baudrate,
+                timeout=self.SERIAL_TIMEOUT,
+                dsrdtr=True
+            )
+            import time; time.sleep(2)  # let the gimbal finish initializing
+            self.get_logger().info(f'Connected to gimbal on {self._port}')
+            return True
+        except serial.SerialException as e:
+            self.ser = None
+            self.get_logger().warn(
+                f'Gimbal not available on {self._port}: {e}. Will retry.',
+                throttle_duration_sec=5.0
+            )
+            return False
 
     def _build_packet(self, cmd: int) -> bytes:
         size = 0
@@ -115,6 +135,10 @@ class GimbalNode(Node):
         }
 
     def timer_cb(self):
+        if not self.ser or not self.ser.is_open:
+            self._connect()
+            return
+
         data = self._read_gimbal()
         if data is None:
             self.get_logger().warn('No data from gimbal', throttle_duration_sec=1.0)
@@ -139,7 +163,7 @@ class GimbalNode(Node):
         self.pub_gyro.publish(gyro_msg)
 
     def destroy_node(self):
-        if self.ser and self.ser.is_open:
+        if self.ser is not None and self.ser.is_open:
             self.ser.close()
         super().destroy_node()
 

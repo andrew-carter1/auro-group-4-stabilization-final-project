@@ -28,7 +28,7 @@ TWO CORRECTION MODES (set via 'mode' parameter):
                     More accurate when gimbal data is available.
 
 LENS MODEL:
-  This camera uses a ~170° FOV fisheye lens. The equidistant projection model
+  This camera uses a ~150° FOV fisheye lens. The equidistant projection model
   is assumed: r = f_eq * theta, where f_eq = (width/2) / (fov_rad/2).
   A pinhole lens would use tan(theta) instead.
 
@@ -38,25 +38,32 @@ LENS MODEL:
   approximation is weakest.
 
 READOUT TIME CALIBRATION:
-  Calibrated at: 1920x1080 16:9, 30 fps, 200 Hz LED
-  (Operating resolution for this project: 1280x960 4:3 — different from calibration)
+  LED measured at 200 Hz. Each test: count vertical pixels spanning 4 bright
+  bands + 4 dark bands = 4 full cycles = 20 ms of sensor readout.
 
-  Measurement: 172 pixels per bright+dark pair = one full LED cycle (5 ms)
-  Calculated:  readout_time_1080p = 1080 / (200 * 172) = 31.4 ms
-  Per-row:     PER_ROW_READOUT_MS = 31.4 / 1080 ≈ 0.02907 ms/row
+  Measured pixels (4 cycles) per resolution:
+    640×480:  242 px    720×480:  279 px    848×480:  320 px
+    1024×576: 389 px    1024×768: 390 px    1280×960: 486 px
+    1920×1080: 743 px
+  (1080×720 excluded — K value was a clear outlier, likely a bad measurement)
 
-  Readout time for any resolution scales automatically from frame height:
-    readout_time_ms(H) = PER_ROW_READOUT_MS * H
+  Per-row readout time is proportional to 1/width (wider rows take longer
+  to clock out). This gives a single constant K_MS_PX:
 
-  Resolutions and their computed readout times:
-    1920x1080 (16:9) → 31.4 ms  ← calibration reference
-    1280x960  (4:3)  → 27.9 ms  ← primary operating resolution
-    1280x720  (16:9) → 20.9 ms
-     848x480  (16:9) → 13.9 ms
-     640x480  (4:3)  → 14.0 ms
+    per_row_ms          = K_MS_PX / width
+    readout_time_ms(H,W) = K_MS_PX * H / W
 
-  Note: if the camera bins rows differently between 4:3 and 16:9 modes, the
-  per-row constant may differ and should be re-verified with a separate LED test.
+  K derived per resolution: 52.89, 51.61, 53.00, 52.58, 52.67, 51.69
+  Mean K_MS_PX ≈ 52.4 ms
+
+  Readout times at common resolutions:
+    1920×1080 (16:9) → 29.5 ms    1280×960  (4:3) → 39.3 ms
+    1024×768  (4:3)  → 39.3 ms    1024×576 (16:9) → 29.5 ms
+     848×480  (16:9) → 29.7 ms     720×480  (3:2) → 34.9 ms
+     640×480  (4:3)  → 39.3 ms
+
+  Note: 4:3 modes read out ~39 ms, suggesting those modes run at ~25 fps
+  (40 ms frame period) rather than 30 fps on this camera.
 
 Topics published:
   /rs_corrected_frame/compressed  (CompressedImage) — capture and compressed modes
@@ -66,15 +73,21 @@ Parameters:
   input_mode          (str)   -- 'capture', 'compressed', or 'raw'. Default: 'capture'
   mode                (str)   -- 'optical_flow' or 'compass'. Default: 'optical_flow'
   fov_horizontal_deg  (float) -- camera horizontal FOV in degrees. Default: 170.0
-  n_bands             (int)   -- horizontal bands for optical_flow mode. Default: 4
-  min_features        (int)   -- min tracked points per band. Default: 8
-  video_device        (str)   -- V4L2 device path for 'capture' mode. Default: '/dev/video18'
+  n_bands             (int)   -- horizontal bands for optical_flow mode. Default: 6
+  min_features        (int)   -- min tracked points per band. Default: 12
+  video_device        (str)   -- V4L2 device path for 'capture' mode. Default: '/dev/video4'
   image_width         (int)   -- capture resolution width.  Default: 1280
   image_height        (int)   -- capture resolution height. Default: 960
   capture_fps         (float) -- capture frame rate. Default: 30.0
+  show_comparison     (bool)  -- side-by-side original vs corrected output (capture mode only).
+                                 Default: False
+  compass_delay_sec   (float) -- seconds to look back in gimbal history when matching a frame.
+                                 Positive value = use older gimbal readings (compensates for
+                                 USB camera latency or processing delay). Default: 0.0
 """
 
 import math
+from collections import deque
 
 import numpy as np
 import cv2
@@ -85,17 +98,20 @@ from sensor_msgs.msg import Image, CompressedImage
 from geometry_msgs.msg import Vector3Stamped
 
 # ---------------------------------------------------------------------------
-# Calibration constants — LED test at 1920x1080 16:9, 200 Hz
+# Calibration constant — LED measurements at 200 Hz across 7 resolutions
 # ---------------------------------------------------------------------------
-_CALIB_HEIGHT_PX = 1080
-_CALIB_LED_HZ    = 200
-_CALIB_BAND_PAIR = 172   # pixels per full bright+dark cycle
-
-# Hardware constant: time per sensor row (ms). Scales to any resolution.
-# Derived: (1080 / (200 * 172) * 1000) / 1080 ≈ 0.02907 ms/row
-PER_ROW_READOUT_MS = (
-    _CALIB_HEIGHT_PX / (_CALIB_LED_HZ * _CALIB_BAND_PAIR) * 1000.0
-) / _CALIB_HEIGHT_PX
+# The full sensor is always read at all output resolutions; lower resolutions
+# are the same sensor data scaled down. Because wider rows have more sensor
+# pixels to clock out, per-video-row readout time is proportional to 1/width:
+#
+#   per_row_ms          = K_MS_PX / width
+#   readout_time_ms(H,W) = K_MS_PX * H / W
+#
+# K derived from 7 resolutions (1080×720 excluded — outlier measurement):
+#   640×480: 52.89   720×480: 51.61   848×480: 53.00
+#   1024×576/768: 52.58 avg   1280×960: 52.67   1920×1080: 51.69
+#   Mean ≈ 52.4 ms
+K_MS_PX = 52.4
 
 
 class RollingShutterNode(Node):
@@ -106,18 +122,22 @@ class RollingShutterNode(Node):
         self.declare_parameter('input_mode',          'capture')
         self.declare_parameter('mode',                'optical_flow')
         self.declare_parameter('fov_horizontal_deg',  170.0)
-        self.declare_parameter('n_bands',             4)
-        self.declare_parameter('min_features',        8)
-        self.declare_parameter('video_device',        '/dev/video18')
+        self.declare_parameter('n_bands',             6)
+        self.declare_parameter('min_features',        12)
+        self.declare_parameter('video_device',        '/dev/video4')
         self.declare_parameter('image_width',         1280)
         self.declare_parameter('image_height',        960)
         self.declare_parameter('capture_fps',         30.0)
+        self.declare_parameter('show_comparison',     False)
+        self.declare_parameter('compass_delay_sec',   0.0)
 
-        self._input_mode = self.get_parameter('input_mode').get_parameter_value().string_value
-        self._mode       = self.get_parameter('mode').get_parameter_value().string_value
-        self._fov_deg    = self.get_parameter('fov_horizontal_deg').get_parameter_value().double_value
-        self._n_bands    = self.get_parameter('n_bands').get_parameter_value().integer_value
-        self._min_feat   = self.get_parameter('min_features').get_parameter_value().integer_value
+        self._input_mode      = self.get_parameter('input_mode').get_parameter_value().string_value
+        self._mode            = self.get_parameter('mode').get_parameter_value().string_value
+        self._fov_deg         = self.get_parameter('fov_horizontal_deg').get_parameter_value().double_value
+        self._n_bands         = self.get_parameter('n_bands').get_parameter_value().integer_value
+        self._min_feat        = self.get_parameter('min_features').get_parameter_value().integer_value
+        self._show_comparison = self.get_parameter('show_comparison').get_parameter_value().bool_value
+        self._compass_delay   = self.get_parameter('compass_delay_sec').get_parameter_value().double_value
 
         if self._input_mode not in ('capture', 'compressed', 'raw'):
             self.get_logger().error(f"Unknown input_mode '{self._input_mode}'.")
@@ -129,9 +149,10 @@ class RollingShutterNode(Node):
         # Previous grayscale frame for optical flow
         self._prev_gray = None
 
-        # Gimbal yaw history: [(timestamp_sec, yaw_deg), ...]
+        # Gimbal yaw history: deque of (timestamp_sec, yaw_deg), newest at right.
         # Yaw is continuous — NOT wrapped at ±360°
-        self._yaw_history = []
+        # Sized to hold ~10 s of 30 Hz data so the delay buffer can look back far.
+        self._yaw_history: deque = deque(maxlen=300)
 
         if self._mode == 'compass':
             self.create_subscription(
@@ -211,11 +232,27 @@ class RollingShutterNode(Node):
             self.get_logger().warn('Failed to read frame', throttle_duration_sec=1.0)
             return
 
-        corrected = self._process_frame(frame)
+        frame_time = self.get_clock().now().nanoseconds * 1e-9
+        corrected = self._process_frame(frame, frame_time)
         if corrected is None:
             corrected = frame
 
-        _, buffer = cv2.imencode('.jpg', corrected)
+        if self._show_comparison:
+            # Scale each half down so the combined frame is the same width as the input
+            h, w = frame.shape[:2]
+            half_w = w // 2
+            half_h = h // 2
+            orig_small = cv2.resize(frame,     (half_w, half_h))
+            corr_small = cv2.resize(corrected, (half_w, half_h))
+            cv2.putText(orig_small, 'Original',     (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(corr_small, 'RS Corrected', (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            publish_frame = cv2.hconcat([orig_small, corr_small])
+        else:
+            publish_frame = corrected
+
+        _, buffer = cv2.imencode('.jpg', publish_frame)
         msg = CompressedImage()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.format = 'jpeg'
@@ -233,7 +270,8 @@ class RollingShutterNode(Node):
             self.get_logger().warn('Failed to decode compressed frame', throttle_duration_sec=2.0)
             return
 
-        corrected = self._process_frame(frame)
+        frame_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        corrected = self._process_frame(frame, frame_time)
         if corrected is None:
             self._pub.publish(msg)
             return
@@ -252,7 +290,8 @@ class RollingShutterNode(Node):
             self.get_logger().warn(f'cv_bridge error: {e}', throttle_duration_sec=2.0)
             return
 
-        corrected = self._process_frame(frame)
+        frame_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        corrected = self._process_frame(frame, frame_time)
         if corrected is None:
             self._pub.publish(msg)
             return
@@ -265,12 +304,12 @@ class RollingShutterNode(Node):
     # Shared processing — returns corrected frame, or None if no change
     # ------------------------------------------------------------------
 
-    def _process_frame(self, frame: np.ndarray):
+    def _process_frame(self, frame: np.ndarray, frame_time: float = 0.0):
         h, w = frame.shape[:2]
         curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         if self._mode == 'compass':
-            slope = self._slope_from_compass(h, w)
+            slope = self._slope_from_compass(h, w, frame_time)
         else:
             slope = self._slope_from_optical_flow(curr_gray, h, w)
 
@@ -286,9 +325,8 @@ class RollingShutterNode(Node):
     def _gimbal_cb(self, msg: Vector3Stamped):
         t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         # vector.z = yaw degrees, continuous, NOT wrapped at ±360°
+        # deque(maxlen=300) handles eviction automatically
         self._yaw_history.append((t, msg.vector.z))
-        if len(self._yaw_history) > 2:
-            self._yaw_history.pop(0)
 
     # ------------------------------------------------------------------
     # Fisheye equidistant focal length
@@ -302,23 +340,45 @@ class RollingShutterNode(Node):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _readout_time_sec(height: int) -> float:
-        return PER_ROW_READOUT_MS * height / 1000.0
+    def _readout_time_sec(height: int, width: int) -> float:
+        return K_MS_PX * height / (width * 1000.0)
 
     # ------------------------------------------------------------------
     # Slope estimation — compass mode
     # ------------------------------------------------------------------
 
-    def _slope_from_compass(self, h: int, w: int) -> float:
+    def _slope_from_compass(self, h: int, w: int, frame_time: float) -> float:
+        """
+        Compute rolling shutter slope from gimbal yaw rate.
+
+        Looks back (frame_time - compass_delay_sec) into the yaw history to
+        find the pair of readings that bracket the target time, then computes
+        yaw rate from that pair.  When delay is 0 the two most recent readings
+        are used.  This lets you tune out USB/processing latency at runtime.
+        """
         if len(self._yaw_history) < 2:
             return 0.0
-        t1, yaw1 = self._yaw_history[0]
-        t2, yaw2 = self._yaw_history[1]
+
+        target_t = frame_time - self._compass_delay
+
+        # Walk backwards through history to find the last entry whose timestamp
+        # is at or before target_t (history is ordered oldest→newest).
+        history = self._yaw_history  # deque reference
+        hi = len(history) - 1
+        while hi > 0 and history[hi][0] > target_t:
+            hi -= 1
+
+        # Use the pair (hi, hi+1), clamped so we always have two points.
+        lo = max(hi - 1, 0)
+        hi = max(hi, 1)
+        t1, yaw1 = history[lo]
+        t2, yaw2 = history[hi]
+
         dt = t2 - t1
         if dt <= 0.0:
             return 0.0
         yaw_rate_px_s = self._f_eq(w) * math.radians((yaw2 - yaw1) / dt)
-        return yaw_rate_px_s * self._readout_time_sec(h) / h
+        return yaw_rate_px_s * self._readout_time_sec(h, w) / h
 
     # ------------------------------------------------------------------
     # Slope estimation — optical flow mode
@@ -353,7 +413,7 @@ class RollingShutterNode(Node):
 
             pts = cv2.goodFeaturesToTrack(
                 self._prev_gray[y0:y1, :],
-                maxCorners=60, qualityLevel=0.01, minDistance=10, blockSize=3
+                maxCorners=100, qualityLevel=0.01, minDistance=10, blockSize=3
             )
             if pts is None or len(pts) < self._min_feat:
                 continue

@@ -27,6 +27,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'realtime_stabilization = stabilization_pkg.realtime_stabilization:main',
             'gimbal_node = stabilization_pkg.gimbal_node:main',
             'rolling_shutter_node = stabilization_pkg.rolling_shutter_node:main',
         ],
