@@ -1,3 +1,5 @@
+import os
+from glob import glob
 from setuptools import find_packages, setup
 
 package_name = 'stabilization_pkg'
@@ -10,6 +12,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -24,6 +27,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'realtime_stabilization = stabilization_pkg.realtime_stabilization:main',
+            'gimbal_node = stabilization_pkg.gimbal_node:main',
+            'rolling_shutter_node = stabilization_pkg.rolling_shutter_node:main',
         ],
     },
 )
