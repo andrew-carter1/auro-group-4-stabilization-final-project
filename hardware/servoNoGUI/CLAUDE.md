@@ -4,36 +4,90 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-This repository contains Python scripts that communicate with a BaseCam SimpleBGC 8-bit gimbal controller over serial (USB-UART) using the SimpleBGC 8-bit Serial API.
+This directory contains Python scripts for controlling a **BaseCam SimpleBGC 8-bit board running firmware 2.2b** over serial (USB-UART) using the SimpleBGC Serial API.
+
+An older copy of `BGC_PowerControl.py` lives at `hardware/BGC_PowerControl.py` — use the scripts here instead.
 
 | Script | Purpose |
 |---|---|
-| `BGC_PowerControl.py` | Zeros PID gains and steps through motor POWER levels [50,100,150,200] with 5-second holds |
-| `bgc_servo_test.py` | Sends a single power level to the PITCH servo with configurable hold time |
-| `bgc_connect.py` | Minimal connection tester — auto-scans baud rates and reports board info |
+| `bgc_read_params.py` | **Start here** — reads and prints all 105 params, sets PWM_FREQ to HIGH, writes back |
+| `bgc_servo_test.py` | Sends power to the PITCH servo with configurable hold time |
+| `BGC_PowerControl.py` | Full experiment: zeros PID gains and steps through POWER levels [50,100,150,200] |
+| `bgc_servo_test_prev.py` | Archived previous iteration of bgc_servo_test — kept for comparison only |
 
-## Running the Scripts
+## Step 1 — Find your device
+
+**WSL2:** USB-serial devices do not appear as `/dev/ttyS*`. Forward via `usbipd` each session:
+
+```powershell
+# PowerShell (Admin) on Windows
+usbipd list                          # find the busid for the SimpleBGC (almost always COM6)
+usbipd attach --wsl --busid <busid>
+```
 
 ```bash
-# BGC_PowerControl.py — power sweep experiment
-python BGC_PowerControl.py COM6
-python BGC_PowerControl.py /dev/ttyS6          # WSL2
-python BGC_PowerControl.py COM6 115200         # custom baud (default: 57600)
-python BGC_PowerControl.py COM6 57600 --sniff   # raw-byte dump, no control commands
-python BGC_PowerControl.py COM6 57600 --listen  # passive capture, no TX
-python BGC_PowerControl.py COM6 57600 --scan    # try all common baud rates
-python BGC_PowerControl.py COM6 57600 --probe   # fire all command IDs and report responses
-
-# bgc_servo_test.py — single power level test
-python bgc_servo_test.py               # COM6, power=100, hold=5s
-python bgc_servo_test.py COM6 150 8    # COM6, power=150, hold=8s
-# Baud is hardcoded to 115200 (confirmed working)
-
-# bgc_connect.py — connection diagnostics
-python bgc_connect.py                  # auto-scan baud rates on COM6
-python bgc_connect.py COM3             # different port
-python bgc_connect.py COM6 57600       # force a single baud rate
+sudo chmod a+rw /dev/ttyACM0   # device appears as ttyACM0, not ttyS6
 ```
+
+## Step 2 — Read params and verify connection
+
+```bash
+python3 bgc_read_params.py /dev/ttyACM0
+```
+
+Sends `CMD_READ_PARAMS` with `[0xFF]` payload (current active profile), prints all 105 fields, sets `PWM_FREQ=1` (HIGH/silent), and writes back. **Do not proceed until this passes.**
+
+## Step 3 — Single servo test
+
+Modifies PITCH only (ROLL/YAW untouched), turns motors on, holds, then shuts off via watchdog + POWER=0.
+
+```bash
+python3 bgc_servo_test.py /dev/ttyACM0          # power=100, hold=5s
+python3 bgc_servo_test.py /dev/ttyACM0 150 8    # power=150, hold=8s
+```
+
+Motors-off sequence: stop sending `CMD_CONTROL`, wait 2s for board watchdog to release serial control mode, then `CMD_WRITE_PARAMS` with all axis POWER=0. `CMD_MOTORS_OFF` (0x6D) is silently ignored by firmware 2.22.
+
+## Step 4 — Full power sweep
+
+Only run once Step 3 is confirmed working.
+
+```bash
+python3 BGC_PowerControl.py /dev/ttyACM0 115200
+python3 BGC_PowerControl.py /dev/ttyACM0 57600 --sniff   # raw-byte dump
+python3 BGC_PowerControl.py /dev/ttyACM0 57600 --listen  # passive capture
+python3 BGC_PowerControl.py /dev/ttyACM0 57600 --scan    # try all baud rates
+python3 BGC_PowerControl.py /dev/ttyACM0 57600 --probe   # fire all command IDs
+```
+
+## Protocol
+
+- Packet: `0x3E | CMD | SIZE | (CMD+SIZE)%256 | [payload] | sum(payload)%256`
+- Baud: 115200, no parity
+- 20ms delay after each command to avoid buffer overflow
+- `CMD_READ_PARAMS` (0x52): two modes depending on caller:
+  - With `[0xFF]` payload → board prepends PROFILE_ID byte; response is 49–105 bytes
+  - No payload → no PROFILE_ID prefix; `bgc_servo_test.py` uses this, expects 48 bytes
+- `CMD_WRITE_PARAMS` (0x57): board responds with `CMD_CONFIRM` (0x43) on success
+- `CMD_MOTORS_OFF` (0x6D): silently ignored by firmware 2.22 — use POWER=0 via WRITE_PARAMS instead
+
+## Params layout
+
+### `bgc_servo_test.py` — no payload, no PROFILE_ID prefix (48 bytes min)
+
+| Bytes | Field |
+|---|---|
+| 0–5, 6–11, 12–17 | ROLL / PITCH / YAW axis: P, I, D, POWER, INVERT, POLES |
+| 18 | ACC_LIMITER |
+| 19–20 | EXT_FC_GAIN_ROLL, EXT_FC_GAIN_PITCH |
+| 21–44 | RC params × 3 axes (8 bytes each: MIN, MAX, MODE, LPF, SPEED, FOLLOW) |
+| 45 | GYRO_TRUST |
+| 46 | USE_MODEL |
+| 47 | PWM_FREQ (0=LOW, 1=HIGH, 2=ULTRA_HIGH) |
+
+### `bgc_read_params.py` — `[0xFF]` payload, PROFILE_ID prefixed (49–105 bytes)
+
+Byte 0 is PROFILE_ID. All axis bytes shift by +1 relative to the no-payload layout. Full 105-byte layout defined by `PARAMS_FMT` struct in `bgc_read_params.py`.
 
 ## Dependencies
 
@@ -41,48 +95,11 @@ python bgc_connect.py COM6 57600       # force a single baud rate
 pip install pyserial
 ```
 
-## Architecture
-
-### BGC_PowerControl.py
-
-**Packet layer** (`build_packet`, `read_response`, `read_response_from_bytes`):
-- Wire format: `0x3E | CMD | SIZE | (CMD+SIZE)%256 | [body] | sum(body)%256`
-- `read_response_from_bytes` parses from an already-captured buffer (no I/O)
-- `read_response` does live I/O with a timeout, scanning for the first matching `expected_cmd`
-
-**High-level commands** (`cmd_board_info`, `read_params`, `write_params`, `motors_on`, `motors_off`, `send_control`):
-- Each wraps a single Serial API command and handles basic error/timeout reporting
-- `send_control` sends `CMD_CONTROL` for PITCH only; ROLL and YAW are left in `MODE_NO_CONTROL`
-
-**Experiment loop** (`main`):
-1. Handshake via `CMD_BOARD_INFO`
-2. Read current params via `CMD_READ_PARAMS` (63-byte body)
-3. Zero P/I/D on all axes; set POWER to first step
-4. Enable motors
-5. For each POWER step: update params, then send `CMD_CONTROL` at 10 Hz for 5 seconds
-6. Turn motors off on exit (including `KeyboardInterrupt`)
-
-### bgc_servo_test.py
-
-Single-shot PITCH servo test. Sets PITCH P=40, I=0, D=10, POWER=`<arg>` (ROLL/YAW untouched), writes params, turns motors on, holds, then turns motors off. Baud hardcoded to 115200. Axis layout: ROLL at offset 0, PITCH at 6, YAW at 12 (6 bytes each: P, I, D, POWER, INVERT, POLES).
-
-### bgc_connect.py
-
-Minimal diagnostic tool. Sends `CMD_BOARD_INFO` and captures raw bytes. With no baud argument, auto-scans [9600, 19200, 38400, 57600, 115200, 230400, 256000] and stops on the first valid SimpleBGC packet. Prints both hex and ASCII of the raw RX buffer for debugging garbled responses.
-
-## Key Constants
-
-| Constant | Value | Notes |
-|---|---|---|
-| `PARAMS_BODY_SIZE` | 63 | Adjust if firmware returns 48 or 64 bytes |
-| `PITCH_TARGET_DEG` | 30.0 | Target pitch angle in degrees |
-| `POWER_STEPS` | [50,100,150,200] | Motor power levels (0–255) |
-| `CONTROL_RATE_HZ` | 10 | CMD_CONTROL send frequency |
-| Default baud | 57600 | Try 115200 if handshake times out |
-
 ## Known Failure Modes
 
-- **Port open fails**: wrong port name or missing permissions (`sudo chmod a+rw /dev/ttyS6`)
-- **CMD_BOARD_INFO times out**: baud rate mismatch; try 115200; close SimpleBGC GUI on Windows (it holds the port)
-- **CMD_READ_PARAMS wrong size**: firmware version mismatch — adjust `PARAMS_BODY_SIZE`
-- **CMD_CONTROL does nothing**: POWER caps PID output, so if P=I=D=0 no current flows. Try setting P=40, D=10 and varying POWER instead of zeroing all gains
+- **Port open fails on WSL2**: use `usbipd attach` then connect to `/dev/ttyACM0`, not `/dev/ttyS6`
+- **Port open fails (permissions)**: `sudo chmod a+rw /dev/ttyACM0`
+- **CMD_BOARD_INFO times out**: baud mismatch; try 115200; close SimpleBGC GUI on Windows (it holds the port)
+- **CMD_READ_PARAMS wrong size**: firmware mismatch — adjust `PARAMS_BODY_SIZE` (48 for 2.2b no-payload, 49+ with `[0xFF]` payload)
+- **CMD_CONTROL does nothing**: if P=I=D=0, POWER has no effect — use P=40, D=10
+- **Motors won't turn off with CMD_MOTORS_OFF**: expected on firmware 2.22 — use watchdog + WRITE_PARAMS POWER=0 (implemented in `bgc_servo_test.py`)
