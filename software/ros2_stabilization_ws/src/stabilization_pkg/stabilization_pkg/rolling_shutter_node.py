@@ -104,6 +104,7 @@ import cv2
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CompressedImage
+from std_msgs.msg import String
 from geometry_msgs.msg import Vector3Stamped
 
 # ---------------------------------------------------------------------------
@@ -140,6 +141,8 @@ class RollingShutterNode(Node):
         self.declare_parameter('max_shift_pct',       0.10)
         self.declare_parameter('slope_ema_alpha',     0.0)
         self.declare_parameter('compass_delay_sec',   0.0)
+        self.declare_parameter('compass_lag_frames',  0)
+        self.declare_parameter('diagnostics',         False)
 
         self._input_mode      = self.get_parameter('input_mode').get_parameter_value().string_value
         self._mode            = self.get_parameter('mode').get_parameter_value().string_value
@@ -149,6 +152,8 @@ class RollingShutterNode(Node):
         self._max_shift_pct   = self.get_parameter('max_shift_pct').get_parameter_value().double_value
         self._ema_alpha       = self.get_parameter('slope_ema_alpha').get_parameter_value().double_value
         self._compass_delay   = self.get_parameter('compass_delay_sec').get_parameter_value().double_value
+        self._lag_frames      = self.get_parameter('compass_lag_frames').get_parameter_value().integer_value
+        self._diagnostics     = self.get_parameter('diagnostics').get_parameter_value().bool_value
         self._fps             = self.get_parameter('capture_fps').get_parameter_value().double_value
 
         if self._input_mode not in ('capture', 'compressed', 'raw'):
@@ -163,6 +168,13 @@ class RollingShutterNode(Node):
 
         # EMA state for slope smoothing (used when slope_ema_alpha > 0)
         self._smoothed_slope = 0.0
+
+        # Diagnostics publisher (only active when diagnostics=True)
+        if self._diagnostics:
+            self._diag_pub = self.create_publisher(String, '/rs_diagnostics', 10)
+
+        # Frame buffer for compass lag compensation (stores (frame, frame_time) tuples)
+        self._frame_buffer: deque = deque()
 
         # Gimbal yaw history: deque of (timestamp_sec, yaw_deg), newest at right.
         # Yaw is continuous — NOT wrapped at ±360°
@@ -248,6 +260,14 @@ class RollingShutterNode(Node):
             return
 
         frame_time = self.get_clock().now().nanoseconds * 1e-9
+
+        # Buffer frames to compensate for gimbal magnetometer filter lag
+        if self._lag_frames > 0:
+            self._frame_buffer.append((frame, frame_time))
+            if len(self._frame_buffer) <= self._lag_frames:
+                return  # still filling buffer
+            frame, frame_time = self._frame_buffer.popleft()
+
         corrected = self._process_frame(frame, frame_time)
         if corrected is None:
             corrected = frame
@@ -326,6 +346,12 @@ class RollingShutterNode(Node):
         else:
             slope = self._slope_from_global_flow(curr_gray, h, w)
 
+        # In diagnostic mode, also compute the other slope for comparison
+        diag_flow_slope = 0.0
+        if self._diagnostics and self._mode == 'compass':
+            diag_flow_slope = self._slope_from_global_flow(curr_gray, h, w)
+
+        raw_slope = slope
         slope = self._clamp_slope(slope, h, w)
 
         # Optional EMA smoothing across frames
@@ -334,10 +360,48 @@ class RollingShutterNode(Node):
                                     + (1.0 - self._ema_alpha) * self._smoothed_slope)
             slope = self._smoothed_slope
 
+        # Publish diagnostics
+        if self._diagnostics:
+            self._publish_diagnostics(raw_slope, slope, diag_flow_slope, h, w)
+
         if abs(slope) < 1e-6:
             return None
 
         return self._apply_remap(frame, slope, h, w)
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+
+    def _publish_diagnostics(self, raw_slope: float, applied_slope: float,
+                             flow_slope: float, h: int, w: int):
+        """Publish diagnostic values to /rs_diagnostics for tuning."""
+        # Get latest yaw info from history
+        yaw_deg = 0.0
+        yaw_rate_deg_s = 0.0
+        if len(self._yaw_history) >= 2:
+            t1, y1 = self._yaw_history[-2]
+            t2, y2 = self._yaw_history[-1]
+            yaw_deg = y2
+            dt = t2 - t1
+            if dt > 0:
+                yaw_rate_deg_s = (y2 - y1) / dt
+
+        # Convert slopes to total pixel shift for readability
+        compass_shift_px = raw_slope * (h - 1)
+        flow_shift_px = flow_slope * (h - 1)
+        applied_shift_px = applied_slope * (h - 1)
+
+        msg = String()
+        msg.data = (
+            f"yaw={yaw_deg:.1f}deg | "
+            f"yaw_rate={yaw_rate_deg_s:.1f}deg/s | "
+            f"compass_shift={compass_shift_px:.1f}px | "
+            f"flow_shift={flow_shift_px:.1f}px | "
+            f"applied={applied_shift_px:.1f}px | "
+            f"buffer={len(self._frame_buffer)}/{self._lag_frames}"
+        )
+        self._diag_pub.publish(msg)
 
     # ------------------------------------------------------------------
     # Gimbal callback
@@ -444,10 +508,12 @@ class RollingShutterNode(Node):
         """
         Compute rolling shutter slope from gimbal yaw rate.
 
-        Looks back (frame_time - compass_delay_sec) into the yaw history to
-        find the pair of readings that bracket the target time, then computes
-        yaw rate from that pair. When delay is 0 the two most recent readings
-        are used. This lets you tune out USB/processing latency at runtime.
+        When compass_lag_frames > 0, the frame has been buffered so the latest
+        gimbal entries now correspond to this frame's physical motion — just use
+        the two most recent yaw_history entries.
+
+        When compass_lag_frames == 0, falls back to the timestamp-based lookup
+        using compass_delay_sec.
 
         px_per_sec = f_eq * yaw_rate_rad_s
         slope      = px_per_sec * readout_time_sec / height
@@ -455,18 +521,22 @@ class RollingShutterNode(Node):
         if len(self._yaw_history) < 2:
             return 0.0
 
-        target_t = frame_time - self._compass_delay
+        if self._lag_frames > 0:
+            # Frame is buffered — latest gimbal data corresponds to this frame's motion
+            t1, yaw1 = self._yaw_history[-2]
+            t2, yaw2 = self._yaw_history[-1]
+        else:
+            # Timestamp-based lookup (for when no frame buffer is used)
+            target_t = frame_time - self._compass_delay
+            history = self._yaw_history
+            hi = len(history) - 1
+            while hi > 0 and history[hi][0] > target_t:
+                hi -= 1
 
-        # Walk backwards to find the last entry at or before target_t
-        history = self._yaw_history
-        hi = len(history) - 1
-        while hi > 0 and history[hi][0] > target_t:
-            hi -= 1
-
-        lo = max(hi - 1, 0)
-        hi = max(hi, 1)
-        t1, yaw1 = history[lo]
-        t2, yaw2 = history[hi]
+            lo = max(hi - 1, 0)
+            hi = max(hi, 1)
+            t1, yaw1 = history[lo]
+            t2, yaw2 = history[hi]
 
         dt = t2 - t1
         if dt <= 0.0:
