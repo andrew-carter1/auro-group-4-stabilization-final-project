@@ -15,14 +15,21 @@ Starts:
                              side-by-side comparison on /rs_corrected_frame/compressed
   2. rqt_image_view       -- displays the comparison output
 
-Calibration: K_MS_PX = 52.4 ms  |  readout_time = K * height / width
-  1280x960 (4:3) → 39.3 ms    1920x1080 (16:9) → 29.5 ms
+Calibration: K_MS_PX = 52.4 ms  |  Operating resolution: 1280×720 (16:9)
+  readout_time = 52.4 × 720 / 1280 ≈ 29.5 ms  (fits within 33.3 ms frame period)
+
+Tuning:
+  max_shift_pct  -- max pixel shift top-to-bottom as fraction of width (default 0.10 = 128 px)
+  slope_ema_alpha -- EMA smoothing on slope; 0.0 = off, higher = smoother but more lag
 
 To run:
   ros2 launch stabilization_pkg rolling_shutter_raw_test_launch.py
 
   # Override device if auto-detection fails:
   ros2 launch stabilization_pkg rolling_shutter_raw_test_launch.py video_device:=/dev/video4
+
+  # Tune correction aggressiveness:
+  ros2 launch stabilization_pkg rolling_shutter_raw_test_launch.py max_shift_pct:=0.05
 
 To use compass mode (gimbal required), use rolling_shutter_compass_launch.py.
 """
@@ -70,9 +77,21 @@ def generate_launch_description():
         default_value=_MOBIUS_DEVICE,
         description='V4L2 device path for the Mobius camera (auto-detected)'
     )
+    max_shift_arg = DeclareLaunchArgument(
+        'max_shift_pct',
+        default_value='0.10',
+        description='Max pixel shift top-to-bottom as fraction of frame width (0.10 = 128 px at 1280 wide)'
+    )
+    ema_arg = DeclareLaunchArgument(
+        'slope_ema_alpha',
+        default_value='0.0',
+        description='EMA smoothing on slope (0.0 = off, higher = smoother but more lag)'
+    )
 
     return LaunchDescription([
         video_device_arg,
+        max_shift_arg,
+        ema_arg,
 
         # Rolling shutter correction with direct camera capture + side-by-side output
         Node(
@@ -84,13 +103,14 @@ def generate_launch_description():
                 'input_mode':          'capture',
                 'mode':                'optical_flow',
                 'fov_horizontal_deg':  150.0,
-                'n_bands':             6,
                 'min_features':        12,
                 'video_device':        LaunchConfiguration('video_device'),
                 'image_width':         1280,
-                'image_height':        960,
+                'image_height':        720,
                 'capture_fps':         30.0,
                 'show_comparison':     True,
+                'max_shift_pct':       LaunchConfiguration('max_shift_pct'),
+                'slope_ema_alpha':     LaunchConfiguration('slope_ema_alpha'),
             }]
         ),
 

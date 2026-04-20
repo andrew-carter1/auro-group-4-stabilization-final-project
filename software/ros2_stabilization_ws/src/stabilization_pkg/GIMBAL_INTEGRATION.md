@@ -1,133 +1,136 @@
-# Gimbal Integration with Stabilization Node
+# Gimbal Integration with Video Stabilization
 
 ## Overview
 
-The current `realtime_stabilization.py` is **vision-only**: it estimates camera motion from optical flow alone and corrects it with an EMA filter. The gimbal node (`gimbal_node.py`) publishes physical angle measurements from the Storm BCG hardware on `/gimbal/angles`.
+The Storm BCG gimbal provides real-time measurements of camera orientation via its onboard magnetometer and gyro, published on `/gimbal/angles` at 30 Hz. The gimbal **mechanically stabilizes roll and pitch** but has no hardware yaw control. Yaw drift is measured but must be corrected via software.
 
-The gimbal controls roll and pitch mechanically, but **has no hardware yaw control**. Yaw (compass direction, from the magnetometer) drifts freely and is the primary target for software correction. The gimbal reads yaw to **0.1° resolution**, making it precise enough to use as a direct correction signal.
-
-The stabilization warp matrix is built from `[dx, dy, da]`:
-- `dx` — horizontal translation (pixels)
-- `dy` — vertical translation (pixels)
-- `da` — in-plane rotation (radians)
-
-Yaw drift shows up in the image primarily as **horizontal drift (`dx`)**. When the drone yaws right, the scene appears to pan left in the frame.
+The primary camera is a **Mobius action camera** (150° horizontal FOV, ~1280×720 typical) feeding into the rolling shutter correction and realtime stabilization pipelines.
 
 ---
 
-## Yaw-to-Pixel Conversion
+## Current Implementation: yaw_stabilizer.py
 
-Converting a yaw delta to a pixel shift requires knowing the horizontal FOV. The current camera is ~160° horizontal FOV at 320px wide.
+A separate ROS2 node (`yaw_stabilizer.py`) performs gimbal-based yaw correction:
 
-Using a simple pinhole approximation:
+**Architecture:**
+1. Subscribes to `/raw_frame/compressed` (unprocessed video from realtime_stabilization.py)
+2. Subscribes to `/gimbal/angles` (yaw from gimbal magnetometer)
+3. Applies a **rotation correction** based on smoothed gimbal yaw
+4. Publishes corrected frames to `/yaw_stabilized/compressed`
 
+**Current approach:**
+```python
+# Smooth the yaw reading over 30 frames
+smoothed_yaw = np.mean(yaw_history)
+correction = (smoothed_yaw - current_yaw) * 5  # gain factor
+
+# Apply rotation correction
+M = cv2.getRotationMatrix2D((w//2, h//2), correction, 1.0)
+frame = cv2.warpAffine(frame, M, (w, h))
 ```
-f_px = (image_width / 2) / tan(FOV_horizontal / 2)
-     = 160 / tan(80°)
-     ≈ 28.2 pixels (effective focal length)
 
+**Status:** This implementation works but is being **refined** to:
+- Use horizontal **translation** (`dx`) instead of in-plane rotation (the original GIMBAL_INTEGRATION plan)
+- Derive the correction gain from the camera's fisheye model rather than a hardcoded multiplier
+
+---
+
+## Original Plan: Yaw-to-Pixel Conversion
+
+Converting yaw delta to a pixel shift requires the horizontal field of view and the camera's projection model.
+
+**Fisheye equidistant model** (150° FOV, Mobius):
+```
+f_eq = (image_width / 2) / (fov_horizontal_radians / 2)
+     = 640 / (2.618 rad / 2)       [at 1280×720]
+     ≈ 488 pixels (equidistant focal length)
+
+dx_pixels = f_eq * tan(d_yaw_radians)
+```
+
+At 150° FOV and 1280 wide: 1° of yaw ≈ **9 pixels** horizontally. This is a significant
+and measurable correction — without it, yaw drift will walk the frame off-center over time.
+
+**Alternative: pinhole lens approximation** (less accurate near edges, simpler):
+```
+f_px = (image_width / 2) / tan(fov_horizontal / 2)
 dx_pixels = f_px * tan(d_yaw_radians)
 ```
 
-At 160° FOV, 1° of yaw ≈ **0.5 pixels** at 320px width. This is a small but cumulative correction — without it, slow yaw drift will walk the frame off-center over time.
-
-> If the camera FOV is measured more precisely later, update `FOV_HORIZONTAL_DEG` below.
-
----
-
-## Integration: Yaw Correction in `realtime_stabilization.py`
-
-### Step 1 — Subscribe to gimbal angles
-
-```python
-from geometry_msgs.msg import Vector3Stamped
-import math
-
-# In __init__:
-FOV_HORIZONTAL_DEG = 160.0  # update if measured more precisely
-self.f_px = (self.width / 2.0) / math.tan(math.radians(FOV_HORIZONTAL_DEG / 2.0))
-
-self.latest_gimbal = None
-self.prev_yaw_rad = None
-
-self.create_subscription(
-    Vector3Stamped,
-    '/gimbal/angles',
-    self._gimbal_cb,
-    10
-)
-
-def _gimbal_cb(self, msg):
-    self.latest_gimbal = msg
-```
-
-### Step 2 — Apply yaw correction in `process_frame`
-
-After the optical flow block computes `current_transform`, override `dx` with the yaw-derived correction:
-
-```python
-if self.latest_gimbal is not None:
-    yaw_rad = math.radians(self.latest_gimbal.vector.z)
-
-    if self.prev_yaw_rad is not None:
-        d_yaw = yaw_rad - self.prev_yaw_rad
-        dx_yaw = self.f_px * math.tan(d_yaw)
-
-        # Replace optical flow horizontal translation with physical measurement.
-        # To blend instead: current_transform[0] = YAW_WEIGHT * dx_yaw + (1 - YAW_WEIGHT) * current_transform[0]
-        current_transform[0] = dx_yaw
-
-    self.prev_yaw_rad = yaw_rad
-```
-
-### Blending vs. replacing
-
-| Approach | When to use |
-|---|---|
-| Full replacement (`current_transform[0] = dx_yaw`) | Gimbal yaw is trusted; optical flow prone to drift |
-| Blend with weight | Tuning phase — start at weight 0.0 (pure optical flow) and increase |
-| Fallback only | Use yaw correction only when optical flow feature count drops below `MIN_FEATURES` |
-
-Start with a blend weight of `0.0` to confirm nothing breaks, then increase.
+The equidistant model is preferred for wide-FOV (>120°) fisheye lenses because it matches
+the actual sensor behavior more closely.
 
 ---
 
-## Roll and Pitch (Secondary)
+## Rate Mismatch & Synchronization
 
-Since the gimbal *mechanically* corrects roll and pitch, the camera should already have minimal roll/pitch motion by the time optical flow sees the frame. These are lower priority than yaw, but if mechanical stabilization is imperfect:
+- **realtime_stabilization.py** runs at ~30 fps (timer 0.033 s)
+- **gimbal_node** publishes at 30 Hz
+- **yaw_stabilizer** subscribes to frames (async, processes on arrival)
 
-- **Roll** (`vector.x`) → maps to `da` (in-plane rotation). Delta roll in radians ≈ correction angle directly.
-- **Pitch** (`vector.y`) → maps to `dy` (vertical translation), similar conversion to yaw using vertical FOV.
-
----
-
-## Rate Mismatch
-
-The stabilization node runs at ~15 fps. The gimbal node runs at 30 Hz. `_gimbal_cb` fires roughly 2× per stabilization frame — this is fine because the callback just caches the latest value and `process_frame` always reads the most recent one. No synchronization needed in a single-threaded executor.
+Both are running at roughly the same rate on a single system. The gimbal publishes its latest
+yaw reading for every frame the camera captures, so synchronization is implicit. In the callback,
+yaw_stabilizer always reads `self.current_yaw` (the most recent gimbal message), which is
+appropriate for per-frame correction.
 
 ---
 
 ## Sign Convention
 
-Verify before trusting the correction:
+Verify the direction of correction before trusting it:
 
-- Gimbal yaw increases clockwise (looking down) — drone nose swings right → `vector.z` increases
-- In the image, drone nose swinging right → scene moves left → `dx` should be negative
+- **Gimbal yaw**: typically increases when drone nose swings **right** (clockwise from above)
+  - `msg.vector.z` increases → yaw increases
+- **In the video**: drone nose swinging right → scene moves **left** → dx should be negative
+- **Correction**: if scene moves left, we want to pan right (positive correction)
 
-You may need to negate:
-```python
-dx_yaw = -self.f_px * math.tan(d_yaw)
-```
+Testing:
+1. Mount gimbal with camera pointing forward
+2. Slowly rotate gimbal clockwise (yaw+)
+3. Watch the video output — does it visually correct by panning right?
+4. If correction goes wrong direction, negate the yaw or dx
 
-Test by slowly rotating the rig clockwise and checking whether the correction moves the frame in the right direction.
+Current yaw_stabilizer uses `(smoothed_yaw - current_yaw) * 5`, which applies a positive
+gain to the yaw error. Verify this sign is correct in practice.
 
 ---
 
-## Quick Start Checklist
+## Future Work: Aligning yaw_stabilizer to the Plan
 
-1. `colcon build && source install/setup.bash`
-2. Terminal 1: `ros2 run stabilization_pkg gimbal_node`
-3. Terminal 2: `ros2 topic echo /gimbal/angles` — confirm yaw is changing as expected
-4. Apply Step 1 and Step 2 changes to `realtime_stabilization.py` with blend weight `0.0` first
-5. Verify no regressions, then increase weight
-6. Check sign convention (see above) if correction appears inverted
+The current yaw_stabilizer.py applies **rotation correction**. To match the original
+GIMBAL_INTEGRATION plan more closely (and likely improve quality):
+
+1. **Compute dx from yaw rate**:
+   ```python
+   d_yaw = yaw2 - yaw1
+   dx_pixels = f_eq * math.tan(math.radians(d_yaw))
+   ```
+
+2. **Apply dx as horizontal translation** (same as rolling shutter correction):
+   ```python
+   map_x = col - dx_pixels / height_samples * row
+   # (maps horizontal motion to per-row shift, matching rolling shutter approach)
+   ```
+
+3. **Use gimbal data to constrain, not replace, optical flow**:
+   - Gimbal yaw rate gives the true camera rotation (high confidence)
+   - Optical flow from realtime_stabilization gives translation (can drift)
+   - Blend: `final_dx = YAW_WEIGHT * dx_yaw + (1 - YAW_WEIGHT) * dx_optical_flow`
+
+This would integrate yaw more deeply into the stabilization pipeline and avoid fighting
+the existing EMA smoothing logic.
+
+---
+
+## Quick Reference: Gimbal Output Format
+
+From gimbal_node.py:
+
+| Topic | Type | Fields | Rate |
+|---|---|---|---|
+| `/gimbal/angles` | geometry_msgs/Vector3Stamped | x=roll°, y=pitch°, z=yaw° (continuous) | 30 Hz |
+| `/gimbal/gyro` | geometry_msgs/Vector3Stamped | x=roll_rate, y=pitch_rate, z=0 (yaw not in packet) | 30 Hz |
+
+- **Yaw is continuous** — does not wrap at ±360°. Rotating clockwise accumulates > +360°
+- **Roll/Pitch** precision: 0.18°/unit (≈ 0.1° after rounding)
+- **Yaw** precision: 0.1°/unit (full resolution)

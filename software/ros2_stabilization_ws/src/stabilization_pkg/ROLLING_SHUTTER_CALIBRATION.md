@@ -41,6 +41,25 @@ expected. Each group of 4 bright bands + 4 dark bands spans 20 ms of readout.
 
 ![Alternating bright and dark bands from 200 Hz LED calibration](rolling_shutter.png)
 
+**Note — unequal band widths:** The bright bands were noticeably wider than the
+dark bands, even though the pair spacing (bright + dark combined) was consistent.
+This is expected and does not affect calibration accuracy. Two effects cause it:
+
+- **Phosphor persistence.** White LEDs work by coating a blue LED with a yellow
+  phosphor. When the current is cut, the phosphor continues re-emitting light for
+  a brief time (tens to hundreds of microseconds). Camera rows scanned during this
+  decay tail see a partially illuminated LED, effectively widening the bright band.
+- **RC discharge in the drive circuit.** A resistor-and-GPIO drive circuit has a
+  small RC time constant from junction capacitance. Turn-on is fast (the GPIO
+  sources current directly); turn-off is slower (discharge through the resistor),
+  producing a gradual falling edge that the camera rows at the transition see as
+  still-lit.
+
+Both effects shift the bright/dark boundary toward the dark side of each cycle,
+making bright bands wider and dark bands narrower — but the *total period*
+(bright + dark) is determined by the LED oscillation frequency and is unaffected.
+Measuring full pairs (bright + dark) eliminates this asymmetry entirely.
+
 ---
 
 ## Measurements
