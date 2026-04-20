@@ -73,6 +73,8 @@ READOUT TIME CALIBRATION:
 Topics published:
   /rs_corrected_frame/compressed  (CompressedImage) — capture and compressed modes
   /rs_corrected_frame/image_raw   (Image)           — raw mode
+  /rs_diagnostics                 (String)          — diagnostics mode only; comma-separated values
+                                                      (yaw, yaw_rate, compass_shift, flow_shift, applied)
 
 Parameters:
   input_mode          (str)   -- 'capture', 'compressed', or 'raw'. Default: 'capture'
@@ -93,6 +95,13 @@ Parameters:
                                  Higher = more smoothing, more lag. Default: 0.0
   compass_delay_sec   (float) -- (compass mode only) seconds to look back in gimbal
                                  history when syncing to a video frame. Default: 0.0
+  compass_lag_frames  (int)   -- (compass mode only) number of frames to buffer before
+                                 processing. Compensates for gimbal magnetometer filter lag.
+                                 Set to ~4 if compass peaks ~133ms behind optical flow.
+                                 Default: 0 (no buffer)
+  diagnostics         (bool)  -- publish /rs_diagnostics (std_msgs/String) at frame rate
+                                 with yaw, yaw_rate, compass_shift, flow_shift, and applied
+                                 values. Useful for timing analysis. Default: False
 """
 
 import math

@@ -21,6 +21,10 @@ Tuning the delay:
   yaw and when the matching video frame arrives. Start at 0.0 and increase in
   small steps (e.g. 0.01) until vertical edges stop leaning.
 
+  compass_lag_frames compensates for gimbal magnetometer filter latency (~133ms).
+  If compass_shift peaks ~4 frames (~133ms) after flow_shift during a fast pan,
+  set this to 4. Requires diagnostics mode to observe.
+
 To run:
   ros2 launch stabilization_pkg rolling_shutter_compass_launch.py
 
@@ -29,6 +33,9 @@ To run:
 
   # Tune sync delay:
   ros2 launch stabilization_pkg rolling_shutter_compass_launch.py compass_delay_sec:=0.03
+
+  # Tune frame buffer for magnetometer lag:
+  ros2 launch stabilization_pkg rolling_shutter_compass_launch.py compass_lag_frames:=4
 
   # Tune max correction:
   ros2 launch stabilization_pkg rolling_shutter_compass_launch.py max_shift_pct:=0.05

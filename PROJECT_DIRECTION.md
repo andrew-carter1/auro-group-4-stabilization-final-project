@@ -3,19 +3,44 @@
 ## Current Project Status
 
 ### What We Have Built
-- **Software-based stabilization**: Optical flow + partial affine transform + EMA smoothing (ALPHA=0.05) on cumulative trajectory
-- **Gimbal hardware integration**: Storm BCG 8-bit gimbal with PID tuning (poles, motor config)
-- **Gimbal communication**: Python script to decode and read raw SimpleBGC protocol packets (roll, pitch, yaw, IMU data)
-- **Camera setup**: Wide field-of-view action camera mounted on gimbal
-- **Computing target**: Nvidia Jetson (ROS2 ready, PWM-capable)
 
-### Hardware Constraint We Can't Change
-The gimbal firmware is **locked** — we cannot access or modify its internal stabilization logic. We can only:
-- Send **target pitch angle** (-45° to +40°)
-- Send **target roll angle** (±360°)
-- Receive **IMU data** (roll/pitch/yaw rates, estimated angles)
+**Video Stabilization**
+- **Core real-time stabilizer**: Optical flow + partial affine transform + EMA smoothing on cumulative trajectory
+  - Split EMA tuning: ALPHA_XY=0.05 (translation), ALPHA_YAW=0.02 (rotation)
+  - Unsharp mask (Gaussian blur) deblurring applied after stabilization
+  - Publishes `/raw_frame/compressed` and `/gimbal/angles` (optical flow yaw estimate)
+- **Rolling shutter correction** (new subsystem):
+  - `rolling_shutter_node.py`: two modes (optical_flow via global estimateAffinePartial2D, compass via gimbal yaw)
+  - Unified formula: `slope_px_per_row = px_per_sec * readout_time_sec / height`
+  - LED calibration: K_MS_PX = 52.4 ms derived from 200 Hz LED measurement across 7 resolutions
+  - Diagnostics mode: `/rs_diagnostics` topic with compass_shift, flow_shift, yaw_rate, applied values
+  - Frame buffer (`compass_lag_frames`): compensates for ~133ms gimbal magnetometer filter lag
+  - Clamping (`max_shift_pct`): limits total shift to prevent runaway corrections
 
-This means gimbal improvements must come from **software-level control** (what angles we command), not firmware-level tuning.
+**Gimbal Integration**
+- **Gimbal node** (`gimbal_node.py`): serial communication with Storm BCG gimbal
+  - Publishes `/gimbal/angles` (roll, pitch, yaw in degrees) and `/gimbal/gyro` at 30 Hz
+  - Graceful reconnection: stays alive if gimbal not available at startup, retries with throttled logging
+- **Yaw stabilizer** (`yaw_stabilizer.py`): separate node for gimbal-based yaw correction
+  - In progress: being refined to use horizontal translation model (from GIMBAL_INTEGRATION plan)
+
+**Hardware**
+- **Storm BCG gimbal** (primary): 2-axis mechanical stabilization (roll, pitch), magnetometer-based yaw measurement
+- **Custom servo gimbal** (parallel side project): manual PID control demonstration as alternative to locked Storm BCG firmware
+- **Camera**: Mobius action camera, 150° horizontal FOV, ~1280×720 operating resolution
+- **Computing platform**: Nvidia Jetson (ROS2 ready)
+
+### Hardware Constraints
+
+**Storm BCG Gimbal** (primary flight hardware): firmware is **locked**
+- We can only send **target pitch angle** (-45° to +40°) and **target roll angle** (±360°)
+- We can only receive **IMU data** (roll/pitch/yaw rates, estimated angles)
+- Gimbal improvements must come from **software-level control** (what angles we command), not firmware-level tuning
+
+**Custom Servo Gimbal** (parallel side project for demonstration)
+- Separate hardware to show manual PID control and servo-based actuation
+- Demonstrates control authority and tuning as an alternative to the locked Storm BCG approach
+- Not intended to replace Storm BCG for flight; useful for understanding gimbal behavior
 
 ### Key Challenge Identified
 The gimbal exhibits instability when base pitch exceeds ~90° (where the pitch axis effectively becomes a yaw axis — gimbal singularity). The TA (David) flagged this as a potential research contribution if solvable.
