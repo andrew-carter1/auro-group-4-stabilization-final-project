@@ -19,13 +19,23 @@ THREE INPUT MODES (set via 'input_mode' parameter):
                   Publishes Image output.
 
 TWO CORRECTION MODES (set via 'mode' parameter):
-  'optical_flow' -- software-only. Divides the frame into horizontal bands,
-                    estimates optical flow in each band independently, fits a
-                    linear model across band dx values to extract the rolling
-                    shutter slope. No gimbal required.
+  'optical_flow' -- software-only. Tracks features across the full frame using
+                    Lucas-Kanade + estimateAffinePartial2D to get a robust global
+                    horizontal shift (dx) per frame. Converts dx to a pixel/second
+                    velocity, then uses the calibrated readout time to compute the
+                    per-row rolling shutter slope. No gimbal required.
   'compass'      -- uses live gimbal yaw rate (/gimbal/angles) plus the fisheye
                     projection model to compute the per-row shift directly.
                     More accurate when gimbal data is available.
+
+UNIFIED SLOPE FORMULA (same for both modes):
+  Global pixel velocity (px/s):
+    optical_flow:  px_per_sec = dx_per_frame * fps
+    compass:       px_per_sec = f_eq * yaw_rate_rad_s
+
+  slope_px_per_row = px_per_sec * readout_time_sec / frame_height
+
+  Both modes run through the same clamp and remap.
 
 LENS MODEL:
   This camera uses a ~150° FOV fisheye lens. The equidistant projection model
@@ -35,7 +45,8 @@ LENS MODEL:
   TODO: perform a proper OpenCV fisheye calibration (cv2.fisheye.calibrate)
   with a checkerboard to get exact k1/k2/k3/k4 distortion coefficients.
   This would improve accuracy near the frame edges where the equidistant
-  approximation is weakest.
+  approximation is weakest. Replace _f_eq() with the actual dr/dtheta
+  evaluated at each row's angle from the optical axis.
 
 READOUT TIME CALIBRATION:
   LED measured at 200 Hz. Each test: count vertical pixels spanning 4 bright
@@ -50,20 +61,14 @@ READOUT TIME CALIBRATION:
   Per-row readout time is proportional to 1/width (wider rows take longer
   to clock out). This gives a single constant K_MS_PX:
 
-    per_row_ms          = K_MS_PX / width
+    per_row_ms           = K_MS_PX / width
     readout_time_ms(H,W) = K_MS_PX * H / W
 
   K derived per resolution: 52.89, 51.61, 53.00, 52.58, 52.67, 51.69
   Mean K_MS_PX ≈ 52.4 ms
 
-  Readout times at common resolutions:
-    1920×1080 (16:9) → 29.5 ms    1280×960  (4:3) → 39.3 ms
-    1024×768  (4:3)  → 39.3 ms    1024×576 (16:9) → 29.5 ms
-     848×480  (16:9) → 29.7 ms     720×480  (3:2) → 34.9 ms
-     640×480  (4:3)  → 39.3 ms
-
-  Note: 4:3 modes read out ~39 ms, suggesting those modes run at ~25 fps
-  (40 ms frame period) rather than 30 fps on this camera.
+  Primary operating resolution: 1280×720 (16:9, 30 fps)
+    readout_time = 52.4 × 720 / 1280 ≈ 29.5 ms  (fits within 33.3 ms frame period)
 
 Topics published:
   /rs_corrected_frame/compressed  (CompressedImage) — capture and compressed modes
@@ -72,18 +77,22 @@ Topics published:
 Parameters:
   input_mode          (str)   -- 'capture', 'compressed', or 'raw'. Default: 'capture'
   mode                (str)   -- 'optical_flow' or 'compass'. Default: 'optical_flow'
-  fov_horizontal_deg  (float) -- camera horizontal FOV in degrees. Default: 170.0
-  n_bands             (int)   -- horizontal bands for optical_flow mode. Default: 6
-  min_features        (int)   -- min tracked points per band. Default: 12
+  fov_horizontal_deg  (float) -- camera horizontal FOV in degrees. Default: 150.0
+  min_features        (int)   -- min tracked points for optical_flow mode. Default: 12
   video_device        (str)   -- V4L2 device path for 'capture' mode. Default: '/dev/video4'
   image_width         (int)   -- capture resolution width.  Default: 1280
-  image_height        (int)   -- capture resolution height. Default: 960
-  capture_fps         (float) -- capture frame rate. Default: 30.0
-  show_comparison     (bool)  -- side-by-side original vs corrected output (capture mode only).
+  image_height        (int)   -- capture resolution height. Default: 720
+  capture_fps         (float) -- capture frame rate (also used as assumed fps for other
+                                 input modes). Default: 30.0
+  show_comparison     (bool)  -- side-by-side original vs corrected output (capture mode).
                                  Default: False
-  compass_delay_sec   (float) -- seconds to look back in gimbal history when matching a frame.
-                                 Positive value = use older gimbal readings (compensates for
-                                 USB camera latency or processing delay). Default: 0.0
+  max_shift_pct       (float) -- maximum total pixel shift (top-to-bottom) as a fraction
+                                 of frame width. Prevents runaway corrections.
+                                 Default: 0.10 (10% of width = 128 px at 1280 wide)
+  slope_ema_alpha     (float) -- EMA smoothing on slope. 0.0 = off (raw per-frame slope).
+                                 Higher = more smoothing, more lag. Default: 0.0
+  compass_delay_sec   (float) -- (compass mode only) seconds to look back in gimbal
+                                 history when syncing to a video frame. Default: 0.0
 """
 
 import math
@@ -104,7 +113,7 @@ from geometry_msgs.msg import Vector3Stamped
 # are the same sensor data scaled down. Because wider rows have more sensor
 # pixels to clock out, per-video-row readout time is proportional to 1/width:
 #
-#   per_row_ms          = K_MS_PX / width
+#   per_row_ms           = K_MS_PX / width
 #   readout_time_ms(H,W) = K_MS_PX * H / W
 #
 # K derived from 7 resolutions (1080×720 excluded — outlier measurement):
@@ -121,23 +130,26 @@ class RollingShutterNode(Node):
 
         self.declare_parameter('input_mode',          'capture')
         self.declare_parameter('mode',                'optical_flow')
-        self.declare_parameter('fov_horizontal_deg',  170.0)
-        self.declare_parameter('n_bands',             6)
+        self.declare_parameter('fov_horizontal_deg',  150.0)
         self.declare_parameter('min_features',        12)
         self.declare_parameter('video_device',        '/dev/video4')
         self.declare_parameter('image_width',         1280)
-        self.declare_parameter('image_height',        960)
+        self.declare_parameter('image_height',        720)
         self.declare_parameter('capture_fps',         30.0)
         self.declare_parameter('show_comparison',     False)
+        self.declare_parameter('max_shift_pct',       0.10)
+        self.declare_parameter('slope_ema_alpha',     0.0)
         self.declare_parameter('compass_delay_sec',   0.0)
 
         self._input_mode      = self.get_parameter('input_mode').get_parameter_value().string_value
         self._mode            = self.get_parameter('mode').get_parameter_value().string_value
         self._fov_deg         = self.get_parameter('fov_horizontal_deg').get_parameter_value().double_value
-        self._n_bands         = self.get_parameter('n_bands').get_parameter_value().integer_value
         self._min_feat        = self.get_parameter('min_features').get_parameter_value().integer_value
         self._show_comparison = self.get_parameter('show_comparison').get_parameter_value().bool_value
+        self._max_shift_pct   = self.get_parameter('max_shift_pct').get_parameter_value().double_value
+        self._ema_alpha       = self.get_parameter('slope_ema_alpha').get_parameter_value().double_value
         self._compass_delay   = self.get_parameter('compass_delay_sec').get_parameter_value().double_value
+        self._fps             = self.get_parameter('capture_fps').get_parameter_value().double_value
 
         if self._input_mode not in ('capture', 'compressed', 'raw'):
             self.get_logger().error(f"Unknown input_mode '{self._input_mode}'.")
@@ -148,6 +160,9 @@ class RollingShutterNode(Node):
 
         # Previous grayscale frame for optical flow
         self._prev_gray = None
+
+        # EMA state for slope smoothing (used when slope_ema_alpha > 0)
+        self._smoothed_slope = 0.0
 
         # Gimbal yaw history: deque of (timestamp_sec, yaw_deg), newest at right.
         # Yaw is continuous — NOT wrapped at ±360°
@@ -190,7 +205,8 @@ class RollingShutterNode(Node):
 
         self.get_logger().info(
             f"Rolling shutter node started — input_mode='{self._input_mode}', "
-            f"mode='{self._mode}', FOV={self._fov_deg}°, bands={self._n_bands}"
+            f"mode='{self._mode}', FOV={self._fov_deg}°, "
+            f"max_shift={self._max_shift_pct*100:.0f}%, ema_alpha={self._ema_alpha}"
         )
 
     # ------------------------------------------------------------------
@@ -201,17 +217,16 @@ class RollingShutterNode(Node):
         device = self.get_parameter('video_device').get_parameter_value().string_value
         width  = self.get_parameter('image_width').get_parameter_value().integer_value
         height = self.get_parameter('image_height').get_parameter_value().integer_value
-        fps    = self.get_parameter('capture_fps').get_parameter_value().double_value
 
         self._cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
         self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self._cap.set(cv2.CAP_PROP_FPS,          fps)
+        self._cap.set(cv2.CAP_PROP_FPS,          self._fps)
         self._cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
 
-        actual_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        actual_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_w   = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h   = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         actual_fps = self._cap.get(cv2.CAP_PROP_FPS)
         self.get_logger().info(
             f"Camera opened: {device} at {actual_w}x{actual_h} @ {actual_fps} fps"
@@ -224,7 +239,7 @@ class RollingShutterNode(Node):
             return
         self._prev_gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
 
-        self.create_timer(1.0 / fps, self._capture_cb)
+        self.create_timer(1.0 / self._fps, self._capture_cb)
 
     def _capture_cb(self):
         success, frame = self._cap.read()
@@ -238,10 +253,8 @@ class RollingShutterNode(Node):
             corrected = frame
 
         if self._show_comparison:
-            # Scale each half down so the combined frame is the same width as the input
             h, w = frame.shape[:2]
-            half_w = w // 2
-            half_h = h // 2
+            half_w, half_h = w // 2, h // 2
             orig_small = cv2.resize(frame,     (half_w, half_h))
             corr_small = cv2.resize(corrected, (half_w, half_h))
             cv2.putText(orig_small, 'Original',     (10, 30),
@@ -311,9 +324,17 @@ class RollingShutterNode(Node):
         if self._mode == 'compass':
             slope = self._slope_from_compass(h, w, frame_time)
         else:
-            slope = self._slope_from_optical_flow(curr_gray, h, w)
+            slope = self._slope_from_global_flow(curr_gray, h, w)
 
-        if abs(slope) < 1e-4:
+        slope = self._clamp_slope(slope, h, w)
+
+        # Optional EMA smoothing across frames
+        if self._ema_alpha > 0.0:
+            self._smoothed_slope = (self._ema_alpha * slope
+                                    + (1.0 - self._ema_alpha) * self._smoothed_slope)
+            slope = self._smoothed_slope
+
+        if abs(slope) < 1e-6:
             return None
 
         return self._apply_remap(frame, slope, h, w)
@@ -333,6 +354,9 @@ class RollingShutterNode(Node):
     # ------------------------------------------------------------------
 
     def _f_eq(self, width: int) -> float:
+        # TODO: once lens calibration (cv2.fisheye.calibrate) is complete, replace
+        # this approximation with the actual dr/dtheta from k1-k4 coefficients,
+        # evaluated at each row's angle from the optical axis.
         return (width / 2.0) / (math.radians(self._fov_deg) / 2.0)
 
     # ------------------------------------------------------------------
@@ -344,6 +368,75 @@ class RollingShutterNode(Node):
         return K_MS_PX * height / (width * 1000.0)
 
     # ------------------------------------------------------------------
+    # Slope clamp
+    # ------------------------------------------------------------------
+
+    def _clamp_slope(self, slope: float, h: int, w: int) -> float:
+        """Limit total top-to-bottom shift to max_shift_pct * frame_width."""
+        limit = self._max_shift_pct * w / h
+        return max(-limit, min(limit, slope))
+
+    # ------------------------------------------------------------------
+    # Slope estimation — optical flow mode (global shift)
+    # ------------------------------------------------------------------
+
+    def _slope_from_global_flow(self, curr_gray: np.ndarray, h: int, w: int) -> float:
+        """
+        Estimate rolling shutter slope from full-frame global optical flow.
+
+        Uses goodFeaturesToTrack + calcOpticalFlowPyrLK + estimateAffinePartial2D
+        across the entire frame (same pattern as realtime_stabilization.py) to get
+        a robust global horizontal shift dx per frame.
+
+        Converts to slope via the unified formula:
+          px_per_sec = dx * fps
+          slope      = px_per_sec * readout_time_sec / height
+
+        The rolling shutter effect adds readout_time/frame_period of the global
+        motion as a differential shift between the top and bottom of the frame.
+
+        TODO: once a pixel-to-degree mapping is calibrated for this lens,
+        convert dx to an estimated yaw_rate_rad_s and use the compass formula
+        for unit-consistent slope (currently uses dx*fps directly).
+
+        Sign note: if panning right produces a positive dx but the remap applies
+        correction in the wrong direction, negate dx here (THIS WAS DONE).
+        """
+        if self._prev_gray is None:
+            self._prev_gray = curr_gray
+            return 0.0
+
+        pts = cv2.goodFeaturesToTrack(
+            self._prev_gray,
+            maxCorners=200, qualityLevel=0.01, minDistance=30, blockSize=3
+        )
+        if pts is None:
+            self._prev_gray = curr_gray
+            return 0.0
+
+        curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            self._prev_gray, curr_gray, pts, None
+        )
+        good = status.flatten() == 1
+        if good.sum() < self._min_feat:
+            self._prev_gray = curr_gray
+            return 0.0
+
+        matrix, _ = cv2.estimateAffinePartial2D(pts[good], curr_pts[good])
+        self._prev_gray = curr_gray
+
+        if matrix is None:
+            return 0.0
+
+        dx = matrix[0, 2]           # global horizontal translation (px/frame)
+        # ADDED: negate DX
+        dx = -dx
+
+        # da = math.atan2(matrix[1, 0], matrix[0, 0])  # in-plane rotation — unused
+        px_per_sec = dx * self._fps
+        return px_per_sec * self._readout_time_sec(h, w) / h
+
+    # ------------------------------------------------------------------
     # Slope estimation — compass mode
     # ------------------------------------------------------------------
 
@@ -353,22 +446,23 @@ class RollingShutterNode(Node):
 
         Looks back (frame_time - compass_delay_sec) into the yaw history to
         find the pair of readings that bracket the target time, then computes
-        yaw rate from that pair.  When delay is 0 the two most recent readings
-        are used.  This lets you tune out USB/processing latency at runtime.
+        yaw rate from that pair. When delay is 0 the two most recent readings
+        are used. This lets you tune out USB/processing latency at runtime.
+
+        px_per_sec = f_eq * yaw_rate_rad_s
+        slope      = px_per_sec * readout_time_sec / height
         """
         if len(self._yaw_history) < 2:
             return 0.0
 
         target_t = frame_time - self._compass_delay
 
-        # Walk backwards through history to find the last entry whose timestamp
-        # is at or before target_t (history is ordered oldest→newest).
-        history = self._yaw_history  # deque reference
+        # Walk backwards to find the last entry at or before target_t
+        history = self._yaw_history
         hi = len(history) - 1
         while hi > 0 and history[hi][0] > target_t:
             hi -= 1
 
-        # Use the pair (hi, hi+1), clamped so we always have two points.
         lo = max(hi - 1, 0)
         hi = max(hi, 1)
         t1, yaw1 = history[lo]
@@ -377,72 +471,10 @@ class RollingShutterNode(Node):
         dt = t2 - t1
         if dt <= 0.0:
             return 0.0
-        yaw_rate_px_s = self._f_eq(w) * math.radians((yaw2 - yaw1) / dt)
-        return yaw_rate_px_s * self._readout_time_sec(h, w) / h
 
-    # ------------------------------------------------------------------
-    # Slope estimation — optical flow mode
-    # ------------------------------------------------------------------
-
-    def _slope_from_optical_flow(self, curr_gray: np.ndarray, h: int, w: int) -> float:
-        """
-        Divides the frame into n_bands horizontal strips and runs Lucas-Kanade
-        optical flow independently in each strip. Fits a linear model to the
-        per-band median dx values:
-
-          dx(row) = intercept + slope * row
-            intercept = global frame translation
-            slope     = rolling shutter distortion in pixels/row
-
-        Interpolation note:
-          Linear interpolation between band centers is sufficient for small
-          distortions. For large yaw rates or long readout times, a cubic
-          spline across band centers would reduce edge artifacts.
-        """
-        if self._prev_gray is None:
-            self._prev_gray = curr_gray
-            return 0.0
-
-        band_h = h // self._n_bands
-        row_centers = []
-        dx_medians  = []
-
-        for i in range(self._n_bands):
-            y0 = i * band_h
-            y1 = min(y0 + band_h, h)
-
-            pts = cv2.goodFeaturesToTrack(
-                self._prev_gray[y0:y1, :],
-                maxCorners=100, qualityLevel=0.01, minDistance=10, blockSize=3
-            )
-            if pts is None or len(pts) < self._min_feat:
-                continue
-
-            # Lift band-relative y coords to full-frame coords before tracking
-            pts_full = pts.copy()
-            pts_full[:, 0, 1] += y0
-
-            curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
-                self._prev_gray, curr_gray, pts_full, None
-            )
-            good = np.where(status.flatten() == 1)[0]
-            if len(good) < self._min_feat:
-                continue
-
-            dx_vals = (curr_pts[good] - pts_full[good])[:, 0, 0]
-            row_centers.append((y0 + y1) / 2.0)
-            dx_medians.append(float(np.median(dx_vals)))
-
-        self._prev_gray = curr_gray
-
-        if len(row_centers) < 2:
-            return 0.0
-
-        x = np.array(row_centers)
-        y = np.array(dx_medians)
-        A = np.vstack([np.ones_like(x), x]).T
-        coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
-        return float(coeffs[1])  # slope = pixels/row
+        yaw_rate_rad_s = math.radians((yaw2 - yaw1) / dt)
+        px_per_sec = self._f_eq(w) * yaw_rate_rad_s
+        return px_per_sec * self._readout_time_sec(h, w) / h
 
     # ------------------------------------------------------------------
     # Per-row remap

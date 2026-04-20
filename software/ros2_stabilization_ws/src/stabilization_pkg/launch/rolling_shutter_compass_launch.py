@@ -13,8 +13,8 @@ Starts:
   2. rolling_shutter_node — compass mode, direct capture, side-by-side output
   3. rqt_image_view       — displays the corrected output
 
-Calibration: K_MS_PX = 52.4 ms  |  Operating resolution: 1280x960 4:3
-  readout_time = K * height / width ≈ 39.3 ms at 1280x960
+Calibration: K_MS_PX = 52.4 ms  |  Operating resolution: 1280×720 (16:9)
+  readout_time = 52.4 × 720 / 1280 ≈ 29.5 ms  (fits within 33.3 ms frame period)
 
 Tuning the delay:
   compass_delay_sec compensates for the time between when the gimbal measures
@@ -29,6 +29,9 @@ To run:
 
   # Tune sync delay:
   ros2 launch stabilization_pkg rolling_shutter_compass_launch.py compass_delay_sec:=0.03
+
+  # Tune max correction:
+  ros2 launch stabilization_pkg rolling_shutter_compass_launch.py max_shift_pct:=0.05
 """
 
 import subprocess
@@ -86,11 +89,17 @@ def generate_launch_description():
             'Increase if the correction lags behind visible shutter skew.'
         )
     )
+    max_shift_arg = DeclareLaunchArgument(
+        'max_shift_pct',
+        default_value='0.10',
+        description='Max pixel shift top-to-bottom as fraction of frame width (0.10 = 128 px at 1280 wide)'
+    )
 
     return LaunchDescription([
         video_device_arg,
         gimbal_port_arg,
         compass_delay_arg,
+        max_shift_arg,
 
         # 1. Gimbal serial reader — provides /gimbal/angles (yaw at 30 Hz)
         Node(
@@ -114,14 +123,13 @@ def generate_launch_description():
                 'input_mode':          'capture',
                 'mode':                'compass',
                 'fov_horizontal_deg':  150.0,
-                'n_bands':             6,       # unused in compass mode, kept for parity
-                'min_features':        12,      # unused in compass mode
                 'video_device':        LaunchConfiguration('video_device'),
                 'image_width':         1280,
-                'image_height':        960,
+                'image_height':        720,
                 'capture_fps':         30.0,
                 'show_comparison':     True,
                 'compass_delay_sec':   LaunchConfiguration('compass_delay_sec'),
+                'max_shift_pct':       LaunchConfiguration('max_shift_pct'),
             }]
         ),
 
