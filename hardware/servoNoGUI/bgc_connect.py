@@ -92,7 +92,7 @@ def try_connect(port: str, baud: int) -> bool:
 
 
 def main():
-    port = sys.argv[1] if len(sys.argv) > 1 else 'COM6'
+    port = sys.argv[1] if len(sys.argv) > 1 else '/dev/ttyACM0'
 
     # If a specific baud was given, try only that one
     if len(sys.argv) > 2:

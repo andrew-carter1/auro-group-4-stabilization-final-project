@@ -45,9 +45,9 @@ CMD_CONTROL      = 0x43  # 67 — host→board: gimbal control (same byte, oppos
 # (Firmware 2.22 returns 94 bytes; bytes 48+ are extended fields — left untouched)
 # ---------------------------------------------------------------------------
 PARAMS_BODY_SIZE = 48
-ROLL_OFFSET      = 0
-PITCH_OFFSET     = 6
-YAW_OFFSET       = 12
+ROLL_OFFSET      = 1
+PITCH_OFFSET     = 7
+YAW_OFFSET       = 13
 IDX_P, IDX_I, IDX_D, IDX_POWER = 0, 1, 2, 3
 PWM_FREQ_OFFSET  = 47
 
@@ -70,6 +70,18 @@ def build_packet(cmd: int, body: bytes = b'') -> bytes:
     hdr_crc  = (cmd + size) & 0xFF
     body_crc = sum(body) & 0xFF
     return bytes([0x3E, cmd, size, hdr_crc]) + body + bytes([body_crc])
+
+def read_raw_byte(ser: serial.Serial, expected: int, timeout: float = 1.0) -> bool:
+    """For commands whose confirmation is a raw ASCII byte (not a SimpleBGC packet)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if ser.in_waiting:
+            b = ser.read(1)[0]
+            if b == expected:
+                return True
+        else:
+            time.sleep(0.02)
+    return False
 
 def read_response(ser: serial.Serial, expected_cmd: int, timeout: float = 2.0) -> bytes | None:
     deadline = time.time() + timeout
@@ -104,8 +116,8 @@ def read_response(ser: serial.Serial, expected_cmd: int, timeout: float = 2.0) -
 
 def main():
     port         = sys.argv[1] if len(sys.argv) > 1 else '/dev/ttyACM0'
-    power        = int(sys.argv[2]) if len(sys.argv) > 2 else 100
-    hold_seconds = float(sys.argv[3]) if len(sys.argv) > 3 else 5.0
+    power        = int(sys.argv[2]) if len(sys.argv) > 2 else 70
+    hold_seconds = float(sys.argv[3]) if len(sys.argv) > 3 else 60.0
 
     print(f"Opening {port} @ {BAUD} baud...")
     try:
@@ -143,35 +155,49 @@ def main():
         ser.close(); sys.exit(1)
     params = bytearray(body)
     print(f"  OK  ({len(body)} bytes)")
+    for name, off in [("ROLL", ROLL_OFFSET), ("PITCH", PITCH_OFFSET), ("YAW", YAW_OFFSET)]:
+        print(f"  {name}: P={params[off+IDX_P]}  I={params[off+IDX_I]}  "
+              f"D={params[off+IDX_D]}  POWER={params[off+IDX_POWER]}")
+
+    # Truncate to 48 bytes — firmware 2.22 returns 94 but CMD_WRITE_PARAMS only accepts 48.
+    # params = params[:PARAMS_BODY_SIZE]
 
     # --- 3. Modify PITCH only + set PWM_FREQ to HIGH ---
-    print(f"\n[3] Setting PITCH: P=40, I=0, D=10, POWER={power}  PWM_FREQ=HIGH  (ROLL/YAW unchanged)")
-    params[PITCH_OFFSET + IDX_P]     = 40
-    params[PITCH_OFFSET + IDX_I]     = 0
-    params[PITCH_OFFSET + IDX_D]     = 10
+    print(f"\n[3] Setting PITCH: P=50, I=0, D=10, POWER={power}  PWM_FREQ=HIGH  (ROLL/YAW unchanged)")
+    params[PITCH_OFFSET + IDX_P]     = 10 # 3
+    params[PITCH_OFFSET + IDX_I]     = 15 # 1  # firmware expects I as int, display value = raw/100
+    params[PITCH_OFFSET + IDX_D]     = 8 # 2
     params[PITCH_OFFSET + IDX_POWER] = power
+    params[ROLL_OFFSET + IDX_P]     = 10 # 3
+    params[ROLL_OFFSET + IDX_I]     = 15 # 1  # firmware expects I as int, display value = raw/100
+    params[ROLL_OFFSET + IDX_D]     = 8 # 2
+    params[ROLL_OFFSET + IDX_POWER] = power
     params[PWM_FREQ_OFFSET]          = 1  # HIGH
 
     # --- 4. Write params, wait for confirm ---
     print("\n[4] CMD_WRITE_PARAMS (0x57)...")
+    
+    ser.reset_input_buffer()
+    print(f"  Writing {len(params)} bytes: {bytes(params).hex()}")
     ser.reset_input_buffer()
     ser.write(build_packet(CMD_WRITE_PARAMS, bytes(params)))
+    # ser.write(build_packet(CMD_WRITE_PARAMS, bytes(params)))
     time.sleep(0.02)
     confirm = read_response(ser, CMD_CONFIRM, timeout=2.0)
     if confirm is not None:
         print("  CMD_CONFIRM received.")
     else:
         print("  [WARN] No CMD_CONFIRM — continuing anyway.")
+        # return
 
     # --- 5. Motors ON ---
+    # Spec says confirmation is raw ASCII 'M' (0x4D), not a SimpleBGC packet.
     print("\n[5] CMD_MOTORS_ON...")
     ser.write(build_packet(CMD_MOTORS_ON))
-    time.sleep(0.02)
-    on_resp = read_response(ser, CMD_CONFIRM, timeout=1.0)
-    if on_resp is not None:
-        print("  CMD_CONFIRM received — motors armed.")
+    if read_raw_byte(ser, ord('M'), timeout=1.0):
+        print("  'M' received — motors armed.")
     else:
-        print("  Motors enabled (no confirm).")
+        print("  No 'M' byte — board may still respond to CMD_CONTROL.")
     time.sleep(0.5)
 
     # --- 6. Hold — pump CMD_CONTROL at 10 Hz so board stays engaged ---
@@ -192,7 +218,7 @@ def main():
     try:
         while time.time() < deadline:
             t0 = time.time()
-            send_control_pitch(0.0)
+            send_control_pitch(30.0)
             elapsed = time.time() - t0
             remaining = interval - elapsed
             if remaining > 0:
