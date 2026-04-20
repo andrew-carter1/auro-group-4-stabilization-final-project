@@ -1,217 +1,256 @@
 import numpy as np
 import cv2
 from collections import deque
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import CompressedImage
+
+def calculate_moving_average(curve, radius):
+    # Calculate the moving average of a curve using a given radius
+    window_size = 2 * radius + 1
+    kernel = np.ones(window_size) / window_size
+    curve_padded = np.pad(curve, (radius, radius), 'edge')
+    smoothed_curve = np.convolve(curve_padded, kernel, mode='same')
+    smoothed_curve = smoothed_curve[radius:-radius]
+    return smoothed_curve
 
 def fix_border(frame):
-    """Slightly zooms and crops to hide black edges from stabilization."""
+    # Fix the frame border by applying rotation and scaling transformation
     frame_shape = frame.shape
-    # zooms in by factor of 1.1
     matrix = cv2.getRotationMatrix2D(
         (frame_shape[1] / 2, frame_shape[0] / 2),
         0,
         1.1
     )
-    return cv2.warpAffine(frame, matrix, (frame_shape[1], frame_shape[0]))
+    
+    frame = cv2.warpAffine(frame, matrix, (frame_shape[1], frame_shape[0]))
+    return frame
 
 
-class StabilizationNode(Node):
-    def __init__(self):
-        super().__init__('stabilization_node')
+# ========== REAL-TIME CONFIGURATION ==========
+# Changed: Use webcam input instead of video file
+cap = cv2.VideoCapture(0)  # 0 for default webcam
 
-        # Publisher for stabilized frames
-        self.publisher = self.create_publisher(CompressedImage, '/stabilized_frame/compressed', 10)
+# Get webcam properties
+width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fps = cap.get(cv2.CAP_PROP_FPS)
+# no longer define the number of frames
 
-        # ========== WEBCAM SETUP ==========
-        self.cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-        self.cap.set(cv2.CAP_PROP_FPS, 15)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+print(f"Webcam: {width}x{height} @ {fps}fps")
 
-        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = self.cap.get(cv2.CAP_PROP_FPS)
-        self.get_logger().info(f"Webcam: {self.width}x{self.height} @ {fps}fps")
 
-        # ========== EMA CONFIGURATION ==========
-        # Higher ALPHA = follows movement faster (less stable)
-        # Lower ALPHA = smoother (more stable, but might see more black borders)
-        self.ALPHA = 0.05
-        self.MIN_FEATURES = 20
+# ========== REAL-TIME SMOOTHING SETUP ==========
+# Changed: Use exponential moving average for real-time smoothing
+# This only uses past data, no future frames needed
+# SMOOTHING_FACTOR = 1.0  # Higher = more smoothing (0.0 to 1.0)
 
-        # Trajectory tracking
-        self.trajectory = np.zeros(3)           # [x, y, angle] - cumulative raw motion
-        self.smoothed_trajectory = np.zeros(3)  # EMA version of trajectory
-        self.prev_transform = np.zeros(3)
+# if less than this many features found, skip stabilization for that frame
+MIN_FEATURES = 20
 
-        self.frame_count = 0
+# Changed: Initialize trajectory tracking variables
+# These will accumulate over time as we process frames
+trajectory = np.zeros(3)  # [x, y, angle] - cumulative motion
+smoothed_trajectory = np.zeros(3)  # Smoothed version of trajectory
+prev_transform = np.zeros(3)  # Previous frame's transformation
 
-        # ========== INITIALIZATION ==========
-        # Read the first frame
-        success, prev_frame = self.cap.read()
-        if not success:
-            self.get_logger().error("Failed to read from webcam!")
-            return
 
-        self.get_logger().info("First frame read successfully!")
+# Changed: Use a buffer to store recent transformations
+# This adds slight latency but gives better smoothing
+ # Number of frames to buffer (lower = less latency) (fps/2 = 1/5 second looking
+ # into future
+BUFFER_SIZE = 24
+transform_buffer = deque(maxlen=BUFFER_SIZE)
+frame_buffer = deque(maxlen=BUFFER_SIZE) 
+trajectory = np.zeros(3)
 
-        # Convert to grayscale for feature tracking
-        self.prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+# ========== INITIALIZATION ==========
+# Read the first frame
+success, prev_frame = cap.read()
+if not success:
+    print("Failed to read from webcam!")
+    exit()
 
-        self.get_logger().info("Starting real-time EMA stabilization...")
+# Convert to grayscale for feature tracking
+prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
 
-        # Timer ~15fps
-        self.timer = self.create_timer(0.066, self.process_frame)
+# Changed: Setup video writer for output (optional)
+#fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+#out = cv2.VideoWriter('stabilized_webcam.mp4', fourcc, 20, (2 * width, height))
 
-    def draw_shake_graph(self, frame_out, history, max_points=100):
-        graph_h, graph_w = 80, frame_out.shape[1]
-        graph = np.zeros((graph_h, graph_w, 3), dtype=np.uint8)
+print("Starting real-time stabilization... Press 'q' to quit")
 
-        # Draw x shake (blue), y shake (green)
-        for i in range(1, len(history)):
-            x1 = int((i - 1) / max_points * graph_w)
-            x2 = int(i / max_points * graph_w)
 
-            # X shake
-            y1 = int(graph_h / 2 - history[i-1][0])
-            y2 = int(graph_h / 2 - history[i][0])
-            cv2.line(graph, (x1, y1), (x2, y2), (255, 0, 0), 1)
+# ========== MAIN REAL-TIME PROCESSING LOOP ==========
+# Changed: Infinite loop instead of fixed frame count
+frame_count = 0
+while True: #process forever
+    # Read current frame from webcam
+    success, curr_frame = cap.read()
+    
+    if not success:
+        print("Failed to read frame")
+        break
 
-            # Y shake
-            y1 = int(graph_h / 2 - history[i-1][1])
-            y2 = int(graph_h / 2 - history[i][1])
-            cv2.line(graph, (x1, y1), (x2, y2), (0, 255, 0), 1)
-
-        cv2.putText(graph, "X shake", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
-        cv2.putText(graph, "Y shake", (5, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-
-        return np.vstack([frame_out, graph])
-
-    def process_frame(self):
-        # Read current frame from webcam
-        success, curr_frame = self.cap.read()
-        if not success:
-            self.get_logger().warn("Failed to read frame")
-            return
-
-        curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
-
-        # ========== FEATURE DETECTION AND TRACKING ==========
-        prev_points = cv2.goodFeaturesToTrack(
-            self.prev_gray,
-            maxCorners=200,
-            qualityLevel=0.01,
-            minDistance=30,
-            blockSize=3
+    frame_buffer.append(curr_frame.copy())
+    
+    # Convert current frame to grayscale
+    curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
+    
+    
+    # ========== FEATURE DETECTION AND TRACKING ==========
+    # Detect feature points in the previous frame (could lower if laggy)
+    prev_points = cv2.goodFeaturesToTrack(
+        prev_gray,
+        maxCorners=200,
+        qualityLevel=0.01,
+        minDistance=30,
+        blockSize=3
+    )
+    
+    # Check if we found enough features
+    if prev_points is None or len(prev_points) < MIN_FEATURES:
+        # Not enough features - skip stabilization for this frame
+        frame_out = cv2.hconcat([curr_frame, curr_frame])
+        cv2.putText(frame_out, "Insufficient features detected", 
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+    else:
+        # Track features from previous to current frame using optical flow
+        curr_points, status, err = cv2.calcOpticalFlowPyrLK(
+            prev_gray,
+            curr_gray,
+            prev_points,
+            None
         )
-
-        current_transform = self.prev_transform.copy()
-
-        if prev_points is not None and len(prev_points) >= self.MIN_FEATURES:
-            # Optical Flow
-            curr_points, status, err = cv2.calcOpticalFlowPyrLK(
-                self.prev_gray, curr_gray, prev_points, None
-            )
-
-            idx = np.where(status == 1)[0]
-            if len(idx) >= 3:
-                prev_points = prev_points[idx]
-                curr_points = curr_points[idx]
-
-                # ========== MOTION ESTIMATION ==========
-                matrix, _ = cv2.estimateAffinePartial2D(prev_points, curr_points)
-
-                if matrix is not None:
-                    dx = matrix[0, 2]
-                    dy = matrix[1, 2]
-                    da = np.arctan2(matrix[1, 0], matrix[0, 0])
-                    current_transform = np.array([dx, dy, da])
-
-        # ========== EMA SMOOTHING ==========
-        # Accumulate the raw global position
-        self.trajectory += current_transform
-
-        if self.frame_count == 0:
-            self.smoothed_trajectory = self.trajectory.copy()
+        
+        # Filter to only keep successfully tracked points
+        idx = np.where(status == 1)[0]
+        prev_points = prev_points[idx]
+        curr_points = curr_points[idx]
+        
+        
+        # ========== MOTION ESTIMATION ==========
+        # Estimate the transformation between frames. otherwise, skip
+        if len(prev_points) >= 3:  # Need at least 3 points
+            matrix, _ = cv2.estimateAffinePartial2D(prev_points, curr_points)
+            
+            if matrix is not None:
+                # Extract transformation parameters
+                translation_x = matrix[0, 2]
+                translation_y = matrix[1, 2]
+                rotation_angle = np.arctan2(matrix[1, 0], matrix[0, 0])
+                
+                current_transform = np.array([translation_x, translation_y, rotation_angle])
+            else:
+                # Estimation failed - use previous transform
+                current_transform = prev_transform
         else:
-            # Apply Exponential Moving Average: S = α*T + (1-α)*S_prev
-            self.smoothed_trajectory = (
-                (self.ALPHA * self.trajectory) +
-                ((1 - self.ALPHA) * self.smoothed_trajectory)
-            )
+            # Not enough points - use previous transform
+            current_transform = prev_transform
+        
+        
+        # Add current transformation to buffer
+    transform_buffer.append(current_transform)
 
-        # Calculate the correction (difference between smooth and raw)
-        diff = self.smoothed_trajectory - self.trajectory
+    # Update cumulative trajectory
+    trajectory += current_transform
 
-        # The actual transform to apply is the current step plus the corrective offset
-        correction = current_transform + diff
+    # Only apply stabilization once buffer is full (after ~0.5 sec delay)
+    if len(transform_buffer) == BUFFER_SIZE:
+        # Average all transforms in the buffer (like the static version's moving average)
+        # Get the OLDEST frame from buffer (the first one added)
+        center_idx = BUFFER_SIZE // 2
+        frame_to_stabilize = list(frame_buffer)[center_idx]
+        
+        # Now we have BUFFER_SIZE frames of future motion data
+        # Smooth the entire trajectory buffer (not just averaging transforms)
+        trajectory_array = np.array(transform_buffer)
 
-        # ========== BUILD WARP MATRIX ==========
-        tx, ty, ta = correction
-        m = np.zeros((2, 3), np.float32)
-        m[0, 0] = np.cos(ta)
-        m[0, 1] = -np.sin(ta)
-        m[1, 0] = np.sin(ta)
-        m[1, 1] = np.cos(ta)
-        m[0, 2] = tx
-        m[1, 2] = ty
+        # Calculate trajectory across the buffered frames
+        cumulative_trajectory = np.cumsum(trajectory_array, axis=0)
 
+        # Smooth the buffered trajectory like in the offline version
+        smoothed_trajectory = np.copy(cumulative_trajectory)
+        for j in range(3):
+            smoothed_trajectory[:, j] = calculate_moving_average(cumulative_trajectory[:, j], radius=3)
+
+        # Correction for the oldest frame in the buffer
+        difference = smoothed_trajectory[center_idx] - cumulative_trajectory[center_idx]        
+        transform_smooth = trajectory_array[center_idx] + difference
+        
+        
         # ========== APPLY STABILIZATION ==========
+        # Extract smoothed transformation parameters
+        translation_x = transform_smooth[0]
+        translation_y = transform_smooth[1]
+        rotation_angle = transform_smooth[2]
+        
+        # Build the transformation matrix
+        transformation_matrix = np.zeros((2, 3), np.float32)
+        transformation_matrix[0, 0] = np.cos(rotation_angle)
+        transformation_matrix[0, 1] = -np.sin(rotation_angle)
+        transformation_matrix[1, 0] = np.sin(rotation_angle)
+        transformation_matrix[1, 1] = np.cos(rotation_angle)
+        transformation_matrix[0, 2] = translation_x
+        transformation_matrix[1, 2] = translation_y
+        
+        # Apply the transformation to stabilize the frame
+        # Apply to the OLDEST frame
         frame_stabilized = cv2.warpAffine(
-            curr_frame, m, (self.width, self.height), flags=cv2.INTER_LANCZOS4
+            frame_to_stabilize,
+            transformation_matrix,
+            (width, height)
         )
+        
+        # Fix borders by slightly zooming in
         frame_stabilized = fix_border(frame_stabilized)
 
-        # ========== PUBLISH COMPRESSED STABILIZED FRAME ==========
-        _, buffer = cv2.imencode('.jpg', frame_stabilized)
-        msg = CompressedImage()
-        msg.format = "jpeg"
-        msg.data = np.array(buffer).tobytes()
-        self.publisher.publish(msg)
+        #apply to frame to stabilize
+        frame_to_stabilize = fix_border(frame_to_stabilize)
+        
+        # Create side-by-side comparison
+        frame_out = cv2.hconcat([frame_to_stabilize, frame_stabilized])
+        frame_buffer.popleft()
 
-        # ========== DISPLAY ==========
+        # Store current transform for next iteration
+        prev_transform = current_transform
+
+    else:
+        # Buffer not full yet - just show original frame
+        frame_stabilized = curr_frame.copy()
         frame_out = cv2.hconcat([curr_frame, frame_stabilized])
+    
+    
+    # ========== OUTPUT AND DISPLAY ==========
+    # Resize if output is too large for screen
+    if frame_out.shape[1] > 1920:
+        frame_out = cv2.resize(
+            frame_out,
+            (frame_out.shape[1] // 2, frame_out.shape[0] // 2)
+        )
+    
+    # Add labels to show which is which
+    cv2.putText(frame_out, "Original", (10, 30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    cv2.putText(frame_out, "Stabilized", (width + 10, 30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    
+    # Display the result
+    cv2.imshow("Real-time Stabilization", frame_out)
+    
+    # Write to output video file
+    # out.write(frame_out)
+    
+    # Update previous frame for next iteration
+    prev_gray = curr_gray
+    frame_count += 1
+    
+    # Check for quit key ('q')
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
 
-        if frame_out.shape[1] > 1920:
-            frame_out = cv2.resize(
-                frame_out, (frame_out.shape[1] // 2, frame_out.shape[0] // 2)
-            )
+# ========== CLEANUP ==========
+# Release resources
+cap.release()
+# out.release()
+cv2.destroyAllWindows()
 
-        cv2.putText(frame_out, "Original", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.putText(frame_out, "Stabilized", (self.width + 10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
-        cv2.imshow("Real-time EMA Stabilization", frame_out)
-        cv2.waitKey(1)
-
-        # Prepare for next frame
-        self.prev_gray = curr_gray
-        self.prev_transform = current_transform
-        self.frame_count += 1
-
-    def destroy_node(self):
-        self.cap.release()
-        cv2.destroyAllWindows()
-        self.get_logger().info(f"Processed {self.frame_count} frames")
-        super().destroy_node()
-
-
-def main(args=None):
-    rclpy.init(args=args)
-    node = StabilizationNode()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
-
-
-if __name__ == '__main__':
-    main()
+print(f"Processed {frame_count} frames")
+print("Stabilized video saved to 'stabilized_webcam.mp4'")
