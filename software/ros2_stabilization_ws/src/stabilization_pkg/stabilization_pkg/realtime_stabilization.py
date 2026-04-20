@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 from collections import deque
+import time
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
@@ -57,17 +58,21 @@ class StabilizationNode(Node):
         self.get_logger().info(f"Webcam: {self.width}x{self.height} @ {fps}fps")
 
         # ========== EMA CONFIGURATION ==========
-        self.ALPHA_XY  = 0.05
-        self.ALPHA_YAW = 0.02
+        self.ALPHA_MIN    = 0.01
+        self.ALPHA_MAX    = 0.15
+        self.ALPHA_XY     = 0.05
+        self.ALPHA_YAW    = 0.02
         self.MIN_FEATURES = 20
+        self.adaptive_mode = True  # press 'a' to toggle
 
         # Trajectory tracking
         self.trajectory          = np.zeros(3)
         self.smoothed_trajectory = np.zeros(3)
         self.prev_transform      = np.zeros(3)
 
-        self.frame_count = 0
+        self.frame_count   = 0
         self.shake_history = deque(maxlen=100)
+        self.last_time     = time.time()
 
         # ========== INITIALIZATION ==========
         success, prev_frame = self.cap.read()
@@ -77,7 +82,7 @@ class StabilizationNode(Node):
 
         self.get_logger().info("First frame read successfully!")
         self.prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-        self.get_logger().info("Starting real-time EMA stabilization with yaw + sharpening...")
+        self.get_logger().info("Starting — press 'a' to toggle adaptive/fixed EMA")
 
         self.timer = self.create_timer(0.033, self.process_frame)
 
@@ -113,8 +118,13 @@ class StabilizationNode(Node):
             self.get_logger().warn("Failed to read frame")
             return
 
-        # ========== PUBLISH RAW FRAME IMMEDIATELY ==========
-        _, raw_buffer = cv2.imencode('.jpg', curr_frame)
+        # ========== FPS ==========
+        now = time.time()
+        fps = 1.0 / (now - self.last_time) if (now - self.last_time) > 0 else 0
+        self.last_time = now
+
+        # ========== PUBLISH RAW FRAME ==========
+        _, raw_buffer  = cv2.imencode('.jpg', curr_frame)
         raw_msg        = CompressedImage()
         raw_msg.format = "jpeg"
         raw_msg.data   = np.array(raw_buffer).tobytes()
@@ -143,10 +153,10 @@ class StabilizationNode(Node):
 
             idx = np.where(status == 1)[0]
             if len(idx) >= 3:
-                prev_points = prev_points[idx]
-                curr_points = curr_points[idx]
+                prev_pts_good = prev_points[idx]
+                curr_pts_good = curr_points[idx]
 
-                matrix, _ = cv2.estimateAffinePartial2D(prev_points, curr_points)
+                matrix, _ = cv2.estimateAffinePartial2D(prev_pts_good, curr_pts_good)
 
                 if matrix is not None:
                     dx = matrix[0, 2]
@@ -154,7 +164,24 @@ class StabilizationNode(Node):
                     da = np.arctan2(matrix[1, 0], matrix[0, 0])
                     current_transform = np.array([dx, dy, da])
 
-        # ========== PUBLISH YAW TO /gimbal/angles ==========
+                # draw feature points on original frame
+                for pt in curr_pts_good:
+                    x, y = pt.ravel()
+                    cv2.circle(curr_frame, (int(x), int(y)), 3, (0, 255, 0), -1)
+
+        # ========== ADAPTIVE vs FIXED EMA ==========
+        shake_magnitude = np.sqrt(dx**2 + dy**2)
+
+        if self.adaptive_mode:
+            self.ALPHA_XY = float(np.clip(
+                0.01 + 0.004 * shake_magnitude,
+                self.ALPHA_MIN,
+                self.ALPHA_MAX
+            ))
+        else:
+            self.ALPHA_XY = 0.05  # fixed
+
+        # ========== PUBLISH YAW ==========
         yaw_msg = Vector3Stamped()
         yaw_msg.header.stamp    = self.get_clock().now().to_msg()
         yaw_msg.header.frame_id = 'camera'
@@ -205,7 +232,7 @@ class StabilizationNode(Node):
         frame_sharpened = sharpen(frame_stabilized)
 
         # ========== PUBLISH STABILIZED FRAME ==========
-        _, buffer = cv2.imencode('.jpg', frame_sharpened)
+        _, buffer  = cv2.imencode('.jpg', frame_sharpened)
         msg        = CompressedImage()
         msg.format = "jpeg"
         msg.data   = np.array(buffer).tobytes()
@@ -219,6 +246,7 @@ class StabilizationNode(Node):
                 frame_out, (frame_out.shape[1] // 2, frame_out.shape[0] // 2)
             )
 
+        # panel labels
         cv2.putText(frame_out, "Original",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         cv2.putText(frame_out, "Stabilized",
@@ -226,15 +254,30 @@ class StabilizationNode(Node):
         cv2.putText(frame_out, "Sharpened",
                     (self.width * 2 + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
+        # metrics
         yaw_degrees = np.degrees(da)
+        mode_label  = "ADAPTIVE" if self.adaptive_mode else "FIXED"
+
         cv2.putText(frame_out, f"Yaw: {yaw_degrees:.2f} deg",
                     (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.putText(frame_out, f"Shake: {shake_magnitude:.1f}px",
+                    (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+        cv2.putText(frame_out, f"EMA: {mode_label} | Alpha: {self.ALPHA_XY:.3f}",
+                    (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        cv2.putText(frame_out, f"FPS: {fps:.1f}",
+                    (self.width * 2 + 10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
         self.shake_history.append(current_transform)
         frame_out = self.draw_shake_graph(frame_out, list(self.shake_history))
 
         cv2.imshow("Stabilization Pipeline", frame_out)
-        cv2.waitKey(1)
+
+        # ========== KEYBOARD TOGGLE ==========
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('a'):
+            self.adaptive_mode = not self.adaptive_mode
+            mode = "ADAPTIVE" if self.adaptive_mode else "FIXED"
+            self.get_logger().info(f"Switched to {mode} EMA")
 
         self.prev_gray      = curr_gray
         self.prev_transform = current_transform
