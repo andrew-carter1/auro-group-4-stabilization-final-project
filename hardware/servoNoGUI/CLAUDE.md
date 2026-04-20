@@ -10,7 +10,8 @@ An older copy of `BGC_PowerControl.py` lives at `hardware/BGC_PowerControl.py` �
 
 | Script | Purpose |
 |---|---|
-| `bgc_read_params.py` | **Start here** — reads and prints all 105 params, sets PWM_FREQ to HIGH, writes back |
+| `bgc_connect.py` | **Start here** — minimal connection tester, auto-scans baud rates |
+| `bgc_read_params.py` | Reads and prints all 105 params, sets PWM_FREQ to HIGH, writes back |
 | `bgc_servo_test.py` | Sends power to the PITCH servo with configurable hold time |
 | `BGC_PowerControl.py` | Full experiment: zeros PID gains and steps through POWER levels [50,100,150,200] |
 | `bgc_servo_test_prev.py` | Archived previous iteration of bgc_servo_test — kept for comparison only |
@@ -29,15 +30,23 @@ usbipd attach --wsl --busid <busid>
 sudo chmod a+rw /dev/ttyACM0   # device appears as ttyACM0, not ttyS6
 ```
 
-## Step 2 — Read params and verify connection
+## Step 2 — Verify the connection
+
+```bash
+python3 bgc_connect.py /dev/ttyACM0
+```
+
+Auto-scans baud rates and prints firmware version. **Do not proceed until this passes.**
+
+## Step 3 — Read params and set PWM_FREQ to HIGH
 
 ```bash
 python3 bgc_read_params.py /dev/ttyACM0
 ```
 
-Sends `CMD_READ_PARAMS` with `[0xFF]` payload (current active profile), prints all 105 fields, sets `PWM_FREQ=1` (HIGH/silent), and writes back. **Do not proceed until this passes.**
+Sends `CMD_READ_PARAMS` with `[0xFF]` payload (current active profile), prints all 105 fields, sets `PWM_FREQ=1` (HIGH/silent), and writes back.
 
-## Step 3 — Single servo test
+## Step 4 — Single servo test
 
 Modifies PITCH only (ROLL/YAW untouched), turns motors on, holds, then shuts off via watchdog + POWER=0.
 
@@ -48,9 +57,9 @@ python3 bgc_servo_test.py /dev/ttyACM0 150 8    # power=150, hold=8s
 
 Motors-off sequence: stop sending `CMD_CONTROL`, wait 2s for board watchdog to release serial control mode, then `CMD_WRITE_PARAMS` with all axis POWER=0. `CMD_MOTORS_OFF` (0x6D) is silently ignored by firmware 2.22.
 
-## Step 4 — Full power sweep
+## Step 5 — Full power sweep
 
-Only run once Step 3 is confirmed working.
+Only run once Step 4 is confirmed working.
 
 ```bash
 python3 BGC_PowerControl.py /dev/ttyACM0 115200
