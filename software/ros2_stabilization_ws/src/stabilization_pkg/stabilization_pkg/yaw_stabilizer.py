@@ -51,7 +51,7 @@ class YawStabilizer(Node):
         # smooth the yaw
         self.yaw_history.append(self.current_yaw)
         smoothed_yaw = np.mean(self.yaw_history)
-        correction   = smoothed_yaw - self.current_yaw
+        correction   = (smoothed_yaw - self.current_yaw) * 5
 
         # apply rotation correction
         h, w = frame.shape[:2]

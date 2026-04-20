@@ -165,9 +165,9 @@ class StabilizationNode(Node):
                     current_transform = np.array([dx, dy, da])
 
                 # draw feature points on original frame
-                for pt in curr_pts_good:
-                    x, y = pt.ravel()
-                    cv2.circle(curr_frame, (int(x), int(y)), 3, (0, 255, 0), -1)
+                #for pt in curr_pts_good:
+                    #x, y = pt.ravel()
+                    #cv2.circle(curr_frame, (int(x), int(y)), 3, (0, 255, 0), -1)
 
         # ========== ADAPTIVE vs FIXED EMA ==========
         shake_magnitude = np.sqrt(dx**2 + dy**2)
