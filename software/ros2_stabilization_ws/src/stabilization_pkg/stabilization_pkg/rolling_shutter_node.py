@@ -152,6 +152,7 @@ class RollingShutterNode(Node):
         self.declare_parameter('compass_delay_sec',   0.0)
         self.declare_parameter('compass_lag_frames',  0)
         self.declare_parameter('diagnostics',         False)
+        self.declare_parameter('show_annotations',    True)
 
         self._input_mode      = self.get_parameter('input_mode').get_parameter_value().string_value
         self._mode            = self.get_parameter('mode').get_parameter_value().string_value
@@ -162,8 +163,9 @@ class RollingShutterNode(Node):
         self._ema_alpha       = self.get_parameter('slope_ema_alpha').get_parameter_value().double_value
         self._compass_delay   = self.get_parameter('compass_delay_sec').get_parameter_value().double_value
         self._lag_frames      = self.get_parameter('compass_lag_frames').get_parameter_value().integer_value
-        self._diagnostics     = self.get_parameter('diagnostics').get_parameter_value().bool_value
-        self._fps             = self.get_parameter('capture_fps').get_parameter_value().double_value
+        self._diagnostics       = self.get_parameter('diagnostics').get_parameter_value().bool_value
+        self._show_annotations  = self.get_parameter('show_annotations').get_parameter_value().bool_value
+        self._fps               = self.get_parameter('capture_fps').get_parameter_value().double_value
 
         if self._input_mode not in ('capture', 'compressed', 'raw'):
             self.get_logger().error(f"Unknown input_mode '{self._input_mode}'.")
@@ -189,6 +191,9 @@ class RollingShutterNode(Node):
         # Yaw is continuous — NOT wrapped at ±360°
         # Sized to hold ~10 s of 30 Hz data so the delay buffer can look back far.
         self._yaw_history: deque = deque(maxlen=300)
+
+        # Store applied slope for comparison frame overlay
+        self._last_slope = 0.0  # px/row
 
         if self._mode == 'compass':
             self.create_subscription(
@@ -223,6 +228,11 @@ class RollingShutterNode(Node):
             self._pub = self.create_publisher(
                 CompressedImage, '/rs_corrected_frame/compressed', 10
             )
+            # Separate comparison topic — side-by-side only when show_comparison=True
+            # The primary topic always carries the clean corrected frame for downstream nodes
+            self._comparison_pub = self.create_publisher(
+                CompressedImage, '/rs_comparison/compressed', 10
+            ) if self._show_comparison else None
 
         self.get_logger().info(
             f"Rolling shutter node started — input_mode='{self._input_mode}', "
@@ -281,7 +291,16 @@ class RollingShutterNode(Node):
         if corrected is None:
             corrected = frame
 
-        if self._show_comparison:
+        # Always publish clean corrected frame for downstream nodes (e.g. yaw_stabilizer)
+        _, buffer = cv2.imencode('.jpg', corrected)
+        msg = CompressedImage()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.format = 'jpeg'
+        msg.data   = np.array(buffer).tobytes()
+        self._pub.publish(msg)
+
+        # Comparison frame published separately so downstream nodes always get clean input
+        if self._show_comparison and self._comparison_pub is not None:
             h, w = frame.shape[:2]
             half_w, half_h = w // 2, h // 2
             orig_small = cv2.resize(frame,     (half_w, half_h))
@@ -290,16 +309,27 @@ class RollingShutterNode(Node):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             cv2.putText(corr_small, 'RS Corrected', (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            publish_frame = cv2.hconcat([orig_small, corr_small])
-        else:
-            publish_frame = corrected
 
-        _, buffer = cv2.imencode('.jpg', publish_frame)
-        msg = CompressedImage()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.format = 'jpeg'
-        msg.data   = np.array(buffer).tobytes()
-        self._pub.publish(msg)
+            if self._show_annotations:
+                # Slope indicator — pivots from center so distortion is symmetric top/bottom
+                mid_x = half_w // 2
+                half_shift = int(self._last_slope * (half_h - 1) / 2)
+                cv2.line(orig_small,
+                         (mid_x - half_shift, 5),
+                         (mid_x + half_shift, half_h - 5),
+                         (0, 255, 255), 2)
+                cv2.line(corr_small, (mid_x, 5), (mid_x, half_h - 5), (0, 255, 255), 2)
+                cv2.putText(corr_small,
+                            f"Shift: {int(self._last_slope * (half_h - 1)):+d}px",
+                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+            comparison_frame = cv2.hconcat([orig_small, corr_small])
+            _, cmp_buf = cv2.imencode('.jpg', comparison_frame)
+            cmp_msg = CompressedImage()
+            cmp_msg.header.stamp = self.get_clock().now().to_msg()
+            cmp_msg.format = 'jpeg'
+            cmp_msg.data = np.array(cmp_buf).tobytes()
+            self._comparison_pub.publish(cmp_msg)
 
     # ------------------------------------------------------------------
     # Subscription callbacks
@@ -372,6 +402,9 @@ class RollingShutterNode(Node):
         # Publish diagnostics
         if self._diagnostics:
             self._publish_diagnostics(raw_slope, slope, diag_flow_slope, h, w)
+
+        # Store slope for comparison frame overlay (even if negligible)
+        self._last_slope = slope
 
         if abs(slope) < 1e-6:
             return None
