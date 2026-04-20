@@ -4,6 +4,8 @@ from collections import deque
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
+from geometry_msgs.msg import Vector3Stamped
+
 
 def fix_border(frame):
     """Slightly zooms and crops to hide black edges from stabilization."""
@@ -16,12 +18,30 @@ def fix_border(frame):
     return cv2.warpAffine(frame, matrix, (frame_shape[1], frame_shape[0]))
 
 
+def sharpen(frame):
+    """Unsharp mask to reduce blur and increase perceived sharpness."""
+    blurred = cv2.GaussianBlur(frame, (0, 0), 3)
+    return cv2.addWeighted(frame, 2.0, blurred, -1.0, 0)
+
+
 class StabilizationNode(Node):
     def __init__(self):
         super().__init__('stabilization_node')
 
         # Publisher for stabilized frames
-        self.publisher = self.create_publisher(CompressedImage, '/stabilized_frame/compressed', 10)
+        self.publisher = self.create_publisher(
+            CompressedImage, '/stabilized_frame/compressed', 10
+        )
+
+        # Publisher for raw frames (feeds yaw_stabilizer)
+        self.raw_publisher = self.create_publisher(
+            CompressedImage, '/raw_frame/compressed', 10
+        )
+
+        # Publisher for yaw angle (feeds yaw_stabilizer)
+        self.gimbal_pub = self.create_publisher(
+            Vector3Stamped, '/gimbal/angles', 10
+        )
 
         # ========== WEBCAM SETUP ==========
         self.cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
@@ -31,42 +51,34 @@ class StabilizationNode(Node):
         self.cap.set(cv2.CAP_PROP_FPS, 15)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.width  = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = self.cap.get(cv2.CAP_PROP_FPS)
         self.get_logger().info(f"Webcam: {self.width}x{self.height} @ {fps}fps")
 
         # ========== EMA CONFIGURATION ==========
-        # Higher ALPHA = follows movement faster (less stable)
-        # Lower ALPHA = smoother (more stable, but might see more black borders)
-        self.ALPHA = 0.05
+        self.ALPHA_XY  = 0.05
+        self.ALPHA_YAW = 0.02
         self.MIN_FEATURES = 20
 
         # Trajectory tracking
-        self.trajectory = np.zeros(3)           # [x, y, angle] - cumulative raw motion
-        self.smoothed_trajectory = np.zeros(3)  # EMA version of trajectory
-        self.prev_transform = np.zeros(3)
+        self.trajectory          = np.zeros(3)
+        self.smoothed_trajectory = np.zeros(3)
+        self.prev_transform      = np.zeros(3)
 
         self.frame_count = 0
-
-        # Shake graph history
         self.shake_history = deque(maxlen=100)
 
         # ========== INITIALIZATION ==========
-        # Read the first frame
         success, prev_frame = self.cap.read()
         if not success:
             self.get_logger().error("Failed to read from webcam!")
             return
 
         self.get_logger().info("First frame read successfully!")
-
-        # Convert to grayscale for feature tracking
         self.prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+        self.get_logger().info("Starting real-time EMA stabilization with yaw + sharpening...")
 
-        self.get_logger().info("Starting real-time EMA stabilization...")
-
-        # Timer ~15fps
         self.timer = self.create_timer(0.033, self.process_frame)
 
     def draw_shake_graph(self, frame_out, history, max_points=100):
@@ -77,27 +89,36 @@ class StabilizationNode(Node):
             x1 = int((i - 1) / max_points * graph_w)
             x2 = int(i / max_points * graph_w)
 
-            # X shake (blue)
             y1 = int(graph_h / 2 - history[i-1][0])
             y2 = int(graph_h / 2 - history[i][0])
             cv2.line(graph, (x1, y1), (x2, y2), (255, 0, 0), 1)
 
-            # Y shake (green)
             y1 = int(graph_h / 2 - history[i-1][1])
             y2 = int(graph_h / 2 - history[i][1])
             cv2.line(graph, (x1, y1), (x2, y2), (0, 255, 0), 1)
 
-        cv2.putText(graph, "X shake", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
-        cv2.putText(graph, "Y shake", (5, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+            y1 = int(graph_h / 2 - history[i-1][2] * 100)
+            y2 = int(graph_h / 2 - history[i][2] * 100)
+            cv2.line(graph, (x1, y1), (x2, y2), (0, 255, 255), 1)
+
+        cv2.putText(graph, "X shake", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0,   0), 1)
+        cv2.putText(graph, "Y shake", (5, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,   255, 0), 1)
+        cv2.putText(graph, "Yaw",     (5, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,   255, 255), 1)
 
         return np.vstack([frame_out, graph])
 
     def process_frame(self):
-        # Read current frame from webcam
         success, curr_frame = self.cap.read()
         if not success:
             self.get_logger().warn("Failed to read frame")
             return
+
+        # ========== PUBLISH RAW FRAME IMMEDIATELY ==========
+        _, raw_buffer = cv2.imencode('.jpg', curr_frame)
+        raw_msg        = CompressedImage()
+        raw_msg.format = "jpeg"
+        raw_msg.data   = np.array(raw_buffer).tobytes()
+        self.raw_publisher.publish(raw_msg)
 
         curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
 
@@ -111,9 +132,11 @@ class StabilizationNode(Node):
         )
 
         current_transform = self.prev_transform.copy()
+        da = 0.0
+        dx = 0.0
+        dy = 0.0
 
         if prev_points is not None and len(prev_points) >= self.MIN_FEATURES:
-            # Optical Flow
             curr_points, status, err = cv2.calcOpticalFlowPyrLK(
                 self.prev_gray, curr_gray, prev_points, None
             )
@@ -123,7 +146,6 @@ class StabilizationNode(Node):
                 prev_points = prev_points[idx]
                 curr_points = curr_points[idx]
 
-                # ========== MOTION ESTIMATION ==========
                 matrix, _ = cv2.estimateAffinePartial2D(prev_points, curr_points)
 
                 if matrix is not None:
@@ -132,32 +154,44 @@ class StabilizationNode(Node):
                     da = np.arctan2(matrix[1, 0], matrix[0, 0])
                     current_transform = np.array([dx, dy, da])
 
+        # ========== PUBLISH YAW TO /gimbal/angles ==========
+        yaw_msg = Vector3Stamped()
+        yaw_msg.header.stamp    = self.get_clock().now().to_msg()
+        yaw_msg.header.frame_id = 'camera'
+        yaw_msg.vector.x = 0.0
+        yaw_msg.vector.y = 0.0
+        yaw_msg.vector.z = np.degrees(da)
+        self.gimbal_pub.publish(yaw_msg)
+
         # ========== EMA SMOOTHING ==========
-        # Accumulate the raw global position
         self.trajectory += current_transform
 
         if self.frame_count == 0:
             self.smoothed_trajectory = self.trajectory.copy()
         else:
-            # Apply Exponential Moving Average: S = α*T + (1-α)*S_prev
-            self.smoothed_trajectory = (
-                (self.ALPHA * self.trajectory) +
-                ((1 - self.ALPHA) * self.smoothed_trajectory)
+            self.smoothed_trajectory[0] = (
+                self.ALPHA_XY * self.trajectory[0] +
+                (1 - self.ALPHA_XY) * self.smoothed_trajectory[0]
+            )
+            self.smoothed_trajectory[1] = (
+                self.ALPHA_XY * self.trajectory[1] +
+                (1 - self.ALPHA_XY) * self.smoothed_trajectory[1]
+            )
+            self.smoothed_trajectory[2] = (
+                self.ALPHA_YAW * self.trajectory[2] +
+                (1 - self.ALPHA_YAW) * self.smoothed_trajectory[2]
             )
 
-        # Calculate the correction (difference between smooth and raw)
-        diff = self.smoothed_trajectory - self.trajectory
-
-        # The actual transform to apply is the current step plus the corrective offset
+        diff       = self.smoothed_trajectory - self.trajectory
         correction = current_transform + diff
 
         # ========== BUILD WARP MATRIX ==========
         tx, ty, ta = correction
-        m = np.zeros((2, 3), np.float32)
-        m[0, 0] = np.cos(ta)
+        m       = np.zeros((2, 3), np.float32)
+        m[0, 0] =  np.cos(ta)
         m[0, 1] = -np.sin(ta)
-        m[1, 0] = np.sin(ta)
-        m[1, 1] = np.cos(ta)
+        m[1, 0] =  np.sin(ta)
+        m[1, 1] =  np.cos(ta)
         m[0, 2] = tx
         m[1, 2] = ty
 
@@ -167,37 +201,44 @@ class StabilizationNode(Node):
         )
         frame_stabilized = fix_border(frame_stabilized)
 
-        # ========== PUBLISH COMPRESSED STABILIZED FRAME ==========
-        _, buffer = cv2.imencode('.jpg', frame_stabilized)
-        msg = CompressedImage()
+        # ========== APPLY SHARPENING ==========
+        frame_sharpened = sharpen(frame_stabilized)
+
+        # ========== PUBLISH STABILIZED FRAME ==========
+        _, buffer = cv2.imencode('.jpg', frame_sharpened)
+        msg        = CompressedImage()
         msg.format = "jpeg"
-        msg.data = np.array(buffer).tobytes()
+        msg.data   = np.array(buffer).tobytes()
         self.publisher.publish(msg)
 
         # ========== DISPLAY ==========
-        frame_out = cv2.hconcat([curr_frame, frame_stabilized])
+        frame_out = cv2.hconcat([curr_frame, frame_stabilized, frame_sharpened])
 
         if frame_out.shape[1] > 1920:
             frame_out = cv2.resize(
                 frame_out, (frame_out.shape[1] // 2, frame_out.shape[0] // 2)
             )
 
-        cv2.putText(frame_out, "Original", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.putText(frame_out, "Stabilized", (self.width + 10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(frame_out, "Original",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(frame_out, "Stabilized",
+                    (self.width + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(frame_out, "Sharpened",
+                    (self.width * 2 + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-        # Draw shake graph below video
+        yaw_degrees = np.degrees(da)
+        cv2.putText(frame_out, f"Yaw: {yaw_degrees:.2f} deg",
+                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
         self.shake_history.append(current_transform)
         frame_out = self.draw_shake_graph(frame_out, list(self.shake_history))
 
-        cv2.imshow("Real-time EMA Stabilization", frame_out)
+        cv2.imshow("Stabilization Pipeline", frame_out)
         cv2.waitKey(1)
 
-        # Prepare for next frame
-        self.prev_gray = curr_gray
+        self.prev_gray      = curr_gray
         self.prev_transform = current_transform
-        self.frame_count += 1
+        self.frame_count   += 1
 
     def destroy_node(self):
         self.cap.release()
