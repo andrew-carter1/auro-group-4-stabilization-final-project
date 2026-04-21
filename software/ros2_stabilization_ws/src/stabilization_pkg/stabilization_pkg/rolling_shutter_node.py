@@ -194,6 +194,7 @@ class RollingShutterNode(Node):
 
         # Store applied slope for comparison frame overlay
         self._last_slope = 0.0  # px/row
+        self._slope_history: deque = deque(maxlen=2)  # for smoothing overlay display
 
         if self._mode == 'compass':
             self.create_subscription(
@@ -327,16 +328,27 @@ class RollingShutterNode(Node):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
             if self._show_annotations:
-                # Slope indicator — pivots from center so distortion is symmetric top/bottom
+                # Compute averaged slope for smoother overlay display
+                avg_slope = (sum(self._slope_history) / len(self._slope_history)
+                             if self._slope_history else 0.0)
+
+                # Green horizontal reference lines — both panels
+                for panel in (orig_small, corr_small):
+                    cv2.line(panel, (0, 5),          (half_w - 1, 5),          (0, 220, 0), 1)
+                    cv2.line(panel, (0, half_h - 5), (half_w - 1, half_h - 5), (0, 220, 0), 1)
+
+                # Yellow slope indicator on orig_small (tilted due to RS distortion)
                 mid_x = half_w // 2
-                half_shift = int(self._last_slope * (half_h - 1) / 2)
+                total_shift = int(avg_slope * (half_h - 1))
                 cv2.line(orig_small,
-                         (mid_x - half_shift, 5),
-                         (mid_x + half_shift, half_h - 5),
+                         (mid_x, 5),
+                         (mid_x + total_shift, half_h - 5),
                          (0, 255, 255), 2)
+
+                # Yellow vertical line on corr_small (perfectly corrected)
                 cv2.line(corr_small, (mid_x, 5), (mid_x, half_h - 5), (0, 255, 255), 2)
                 cv2.putText(corr_small,
-                            f"Shift: {int(self._last_slope * (half_h - 1)):+d}px",
+                            f"Shift: {total_shift:+d}px",
                             (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
             comparison_frame = cv2.hconcat([orig_small, corr_small])
@@ -421,6 +433,7 @@ class RollingShutterNode(Node):
 
         # Store slope for comparison frame overlay (even if negligible)
         self._last_slope = slope
+        self._slope_history.append(slope)
 
         if abs(slope) < 1e-6:
             return None

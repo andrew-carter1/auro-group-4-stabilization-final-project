@@ -12,7 +12,7 @@ Full annotated pipeline with all comparison views:
                                            → /demo_full_pipeline     (raw | rs | yaw, 3-panel)
 
 Viewers launched:
-  - /rs_comparison/compressed      side-by-side RS correction with slope lines
+  - /rs_comparison/compressed      side-by-side RS correction with slope lines + green references
   - /demo_full_pipeline/compressed 3-panel end-to-end pipeline view (half-size)
 
 To run (annotated, default):
@@ -27,9 +27,6 @@ Selective annotation control:
 
 Tuning:
   ros2 launch stabilization_pkg demo_rs_yaw_launch.py compass_lag_frames:=5
-  ros2 launch stabilization_pkg demo_rs_yaw_launch.py reference_alpha:=0.01
-  ros2 launch stabilization_pkg demo_rs_yaw_launch.py p_gain:=0.8
-  ros2 launch stabilization_pkg demo_rs_yaw_launch.py d_gain:=0.2
   ros2 launch stabilization_pkg demo_rs_yaw_launch.py max_margin_px:=100
 """
 
@@ -75,9 +72,6 @@ def generate_launch_description():
         DeclareLaunchArgument('max_shift_pct',      default_value='0.10'),
         DeclareLaunchArgument('max_margin_px',      default_value='80'),
         DeclareLaunchArgument('yaw_lag_frames',     default_value='0'),
-        DeclareLaunchArgument('reference_alpha',    default_value='0.02'),
-        DeclareLaunchArgument('p_gain',             default_value='1.0'),
-        DeclareLaunchArgument('d_gain',             default_value='0.0'),
         # Per-node annotation control
         DeclareLaunchArgument('rs_annotations',     default_value='true'),
         DeclareLaunchArgument('yaw_annotations',    default_value='true'),
@@ -126,7 +120,7 @@ def generate_launch_description():
         ),
 
         # ----------------------------------------------------------------
-        # 3. Yaw stabilizer (EMA + PD + tanh soft clamping)
+        # 3. Yaw stabilizer (follow-at-margin control)
         #    → /yaw_stabilized/compressed  (960×720, 4:3)
         # ----------------------------------------------------------------
         Node(
@@ -139,9 +133,6 @@ def generate_launch_description():
                 'max_margin_px':       LaunchConfiguration('max_margin_px'),
                 'out_w':               960,
                 'yaw_lag_frames':      LaunchConfiguration('yaw_lag_frames'),
-                'reference_alpha':     LaunchConfiguration('reference_alpha'),
-                'p_gain':              LaunchConfiguration('p_gain'),
-                'd_gain':              LaunchConfiguration('d_gain'),
                 'show_annotations':    LaunchConfiguration('yaw_annotations'),
             }]
         ),
