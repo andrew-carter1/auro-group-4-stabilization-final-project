@@ -106,7 +106,7 @@ def generate_launch_description():
             parameters=[{
                 'input_mode':          'capture',
                 'mode':                'compass',
-                'fov_horizontal_deg':  150.0,
+                'fov_horizontal_deg':  130.0,
                 'video_device':        LaunchConfiguration('video_device'),
                 'image_width':         1280,
                 'image_height':        720,

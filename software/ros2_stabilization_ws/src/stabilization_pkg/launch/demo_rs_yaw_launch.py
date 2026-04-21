@@ -75,7 +75,7 @@ def generate_launch_description():
         DeclareLaunchArgument('max_shift_pct',      default_value='0.10'),
         DeclareLaunchArgument('max_margin_px',      default_value='80'),
         DeclareLaunchArgument('yaw_lag_frames',     default_value='0'),
-        DeclareLaunchArgument('reference_alpha',    default_value='0.08'),
+        DeclareLaunchArgument('reference_alpha',    default_value='0.06'),
         DeclareLaunchArgument('p_gain',             default_value='1.0'),
         DeclareLaunchArgument('d_gain',             default_value='0.3'),
         # Per-node annotation control
@@ -163,16 +163,9 @@ def generate_launch_description():
         ),
 
         # ----------------------------------------------------------------
-        # 5. Viewers
+        # 5. Viewer
         # ----------------------------------------------------------------
-        # RS correction side-by-side (with slope lines)
-        Node(
-            package='rqt_image_view',
-            executable='rqt_image_view',
-            name='rs_viewer',
-            arguments=['/rs_comparison/compressed']
-        ),
-        # Full 3-panel pipeline comparison
+        # Full 3-panel pipeline comparison (raw | rs | yaw)
         Node(
             package='rqt_image_view',
             executable='rqt_image_view',

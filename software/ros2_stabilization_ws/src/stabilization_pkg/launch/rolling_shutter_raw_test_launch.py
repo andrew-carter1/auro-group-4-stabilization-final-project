@@ -102,7 +102,7 @@ def generate_launch_description():
             parameters=[{
                 'input_mode':          'capture',
                 'mode':                'optical_flow',
-                'fov_horizontal_deg':  150.0,
+                'fov_horizontal_deg':  130.0,
                 'min_features':        12,
                 'video_device':        LaunchConfiguration('video_device'),
                 'image_width':         1280,

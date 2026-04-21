@@ -340,8 +340,8 @@ class RollingShutterNode(Node):
 
                 # Green vertical reference lines — both panels (at quarter points)
                 for panel in (orig_small, corr_small):
-                    cv2.line(panel, (half_w // 4, 0),     (half_w // 4, half_h - 1),     (0, 220, 0), 1)
-                    cv2.line(panel, (3 * half_w // 4, 0), (3 * half_w // 4, half_h - 1), (0, 220, 0), 1)
+                    cv2.line(panel, (half_w // 3, 0),     (half_w // 3, half_h - 1),     (0, 220, 0), 1)
+                    cv2.line(panel, (2 * half_w // 3, 0), (2 * half_w // 3, half_h - 1), (0, 220, 0), 1)
 
                 # Yellow slope indicator on orig_small — pivots from center
                 mid_x = half_w // 2

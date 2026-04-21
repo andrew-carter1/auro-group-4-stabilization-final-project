@@ -62,7 +62,7 @@ def generate_launch_description():
         DeclareLaunchArgument('max_shift_pct',      default_value='0.10'),
         DeclareLaunchArgument('max_margin_px',      default_value='80'),
         DeclareLaunchArgument('yaw_lag_frames',     default_value='0'),
-        DeclareLaunchArgument('reference_alpha',    default_value='0.08'),
+        DeclareLaunchArgument('reference_alpha',    default_value='0.06'),
         DeclareLaunchArgument('p_gain',             default_value='1.0'),
         DeclareLaunchArgument('d_gain',             default_value='0.2'),
 
@@ -92,7 +92,7 @@ def generate_launch_description():
             parameters=[{
                 'input_mode':          'capture',
                 'mode':                'compass',
-                'fov_horizontal_deg':  150.0,
+                'fov_horizontal_deg':  130.0,
                 'video_device':        LaunchConfiguration('video_device'),
                 'image_width':         1280,
                 'image_height':        720,
