@@ -1,5 +1,5 @@
 """
-Yaw Stabilizer — Follow-at-Margin Control
+Yaw Stabilizer — EMA Reference + PD Control
 
 Subscribes to rolling shutter corrected frames and gimbal yaw. Applies yaw stabilization
 via horizontal pixel translation using a fisheye equidistant projection model.
@@ -8,24 +8,24 @@ Pipeline position:
   /rs_corrected_frame/compressed  →  [yaw_stabilizer]  →  /yaw_stabilized/compressed
 
 Stabilization logic:
-  1. Compute the required correction: correction_deg = reference_yaw - current_yaw
-  2. Convert to pixels via fisheye equidistant model: dx = f_eq * tan(correction_deg)
-  3. Follow-at-margin control:
-     - If |dx| <= max_margin_px: hold reference frozen, apply full correction. Resists jitter.
-     - If |dx| > max_margin_px: slide reference to hold correction at ±margin. Lets pans through.
-  4. Translate crop window horizontally by dx (sliding crop, no warping).
-  5. Output is a 4:3 center-cropped window (out_w × h, default 960 × input_h).
-
-This is the "stiction" model: the crop pins to a steady point until motion exceeds the headroom,
-then follows at the margin. Once motion reverses, the crop re-freezes at the edge.
+  1. A slow EMA tracks the "intended" camera heading (reference_alpha controls drift rate).
+     Higher alpha = faster return to center (more aggressive jitter rejection).
+  2. Correction = (reference_yaw - current_yaw) → converted to pixels via fisheye model.
+  3. P gain scales the correction; D gain damps rapid dx changes (prevents oscillation).
+  4. dx is averaged over the last 2 frames for smooth motion.
+  5. Output is a 4:3 center-cropped sliding window (out_w × h, default 960 × input_h).
 
 Parameters:
-  fov_horizontal_deg (float): camera horizontal FOV. Default 130.0 (Mobius).
-  max_margin_px (int):        half-width of crop headroom in pixels. Default 80.
-                              Correction is clamped to ±max_margin_px via reference sliding.
+  fov_horizontal_deg (float): camera horizontal FOV. Default 100.0 (Mobius).
+  max_margin_px (int):        hard clamp headroom in pixels. Default 80.
   out_w (int):                explicit output crop width. Default 960 (4:3 at 720h).
   yaw_lag_frames (int):       frame buffer for gimbal lag compensation. Default 0.
-  show_annotations (bool):    show anchor crosshair + yaw/correction text. Default True.
+  reference_alpha (float):    EMA update rate for baseline yaw. Range 0.0–1.0.
+                              Higher = faster return to center. Default 0.08.
+  p_gain (float):             proportional gain on dx correction. 1.0 = full fisheye correction.
+                              Default 1.0.
+  d_gain (float):             derivative gain on dx rate-of-change (damping). Default 0.2.
+  show_annotations (bool):    show anchor crosshair + yaw/dx text. Default True.
 """
 
 import math
@@ -46,16 +46,22 @@ class YawStabilizer(Node):
         # ------------------------------------------------------------------
         # Parameters
         # ------------------------------------------------------------------
-        self.declare_parameter('fov_horizontal_deg', 130.0)
+        self.declare_parameter('fov_horizontal_deg', 100.0)
         self.declare_parameter('max_margin_px',      80)
         self.declare_parameter('out_w',              960)
         self.declare_parameter('yaw_lag_frames',     0)
+        self.declare_parameter('reference_alpha',    0.08)
+        self.declare_parameter('p_gain',             1.0)
+        self.declare_parameter('d_gain',             0.2)
         self.declare_parameter('show_annotations',   True)
 
         self._fov_deg          = self.get_parameter('fov_horizontal_deg').get_parameter_value().double_value
         self._max_margin_px    = self.get_parameter('max_margin_px').get_parameter_value().integer_value
         self._out_w            = self.get_parameter('out_w').get_parameter_value().integer_value
         self._lag_frames       = self.get_parameter('yaw_lag_frames').get_parameter_value().integer_value
+        self._ref_alpha        = self.get_parameter('reference_alpha').get_parameter_value().double_value
+        self._p_gain           = self.get_parameter('p_gain').get_parameter_value().double_value
+        self._d_gain           = self.get_parameter('d_gain').get_parameter_value().double_value
         self._show_annotations = self.get_parameter('show_annotations').get_parameter_value().bool_value
 
         # ------------------------------------------------------------------
@@ -73,10 +79,13 @@ class YawStabilizer(Node):
         # ------------------------------------------------------------------
         self._current_yaw  = 0.0
         self._reference_yaw = None   # initialised on first gimbal reading
+        self._prev_dx_raw  = 0.0    # for D term
+        self._dx_history: deque = deque(maxlen=2)  # for 2-frame averaging
         self._frame_buffer: deque = deque()
 
         self.get_logger().info(
-            f"Yaw stabilizer started — follow-at-margin mode, "
+            f"Yaw stabilizer started — EMA + PD, "
+            f"ref_alpha={self._ref_alpha}, p={self._p_gain}, d={self._d_gain}, "
             f"margin={self._max_margin_px}px, out_w={self._out_w}"
         )
 
@@ -85,10 +94,17 @@ class YawStabilizer(Node):
     # ------------------------------------------------------------------
 
     def gimbal_callback(self, msg: Vector3Stamped):
-        """Update current yaw. Reference is only adjusted via follow-at-margin in frame processing."""
+        """Update current yaw and advance the slow EMA reference baseline."""
         self._current_yaw = msg.vector.z
         if self._reference_yaw is None:
             self._reference_yaw = self._current_yaw  # cold-start: align reference to first reading
+        else:
+            # EMA: reference drifts toward current_yaw at rate ref_alpha
+            # Higher alpha = faster return to center
+            self._reference_yaw = (
+                (1.0 - self._ref_alpha) * self._reference_yaw
+                + self._ref_alpha * self._current_yaw
+            )
 
     def frame_callback(self, msg: CompressedImage):
         """Buffer frames for lag compensation, then process."""
@@ -115,7 +131,7 @@ class YawStabilizer(Node):
         out_w = min(self._out_w, w)  # never wider than input
 
         # ------------------------------------------------------------------
-        # Follow-at-margin control
+        # PD control on pixel offset
         # ------------------------------------------------------------------
         correction_deg = self._reference_yaw - self._current_yaw
 
@@ -123,16 +139,26 @@ class YawStabilizer(Node):
         f_eq = (w / 2.0) / (fov_rad / 2.0)           # equidistant focal length
         dx_raw = f_eq * math.tan(math.radians(correction_deg))
 
+        # P term
+        dx_p = self._p_gain * dx_raw
+
+        # D term — damps rapid changes in the correction
+        dx_delta = dx_raw - self._prev_dx_raw
+        dx_controlled = dx_p - self._d_gain * dx_delta
+        self._prev_dx_raw = dx_raw
+
+        # Hard clamp to ±max_margin_px
         m = float(self._max_margin_px)
-        if m > 0 and abs(dx_raw) > m:
-            # Correction exceeds crop headroom — slide reference to hold at ±margin
-            target_dx = math.copysign(m, dx_raw)
-            target_correction_deg = math.degrees(math.atan(target_dx / f_eq))
-            self._reference_yaw = self._current_yaw + target_correction_deg
-            dx_final = target_dx
+        dx_controlled = max(-m, min(m, dx_controlled))
+
+        # Average dx over 2 frames: 66% current, 33% previous (weighted for responsiveness)
+        self._dx_history.append(dx_controlled)
+        if len(self._dx_history) == 2:
+            dx_final = 0.66 * self._dx_history[1] + 0.34 * self._dx_history[0]
+        elif self._dx_history:
+            dx_final = self._dx_history[0]
         else:
-            # Within window — hold reference frozen, apply full correction (resists jitter)
-            dx_final = dx_raw
+            dx_final = 0.0
 
         # ------------------------------------------------------------------
         # Sliding crop
@@ -142,22 +168,22 @@ class YawStabilizer(Node):
         frame_out = frame[:, x0:x0 + out_w].copy()
 
         # ------------------------------------------------------------------
-        # Annotations
+        # Annotations: three crosshairs at 0.25w, 0.5w, 0.75w to show fisheye effect
         # ------------------------------------------------------------------
         if self._show_annotations:
-            anchor_x = int(w // 2 - x0)   # original center mapped into output
             anchor_y = h // 2
-            # Crosshair at world anchor point
-            cv2.circle(frame_out, (anchor_x, anchor_y), 8, (0, 255, 255), 2)
-            cv2.line(frame_out, (anchor_x - 14, anchor_y), (anchor_x + 14, anchor_y),
-                     (0, 255, 255), 1)
-            cv2.line(frame_out, (anchor_x, anchor_y - 14), (anchor_x, anchor_y + 14),
-                     (0, 255, 255), 1)
+
+            # Draw crosshairs at three positions: left, center, right
+            for frac, color in [(0.25, (100, 100, 255)), (0.50, (0, 255, 255)), (0.75, (255, 100, 100))]:
+                x_pos = int(frac * out_w)
+                cv2.circle(frame_out, (x_pos, anchor_y), 6, color, 2)
+                cv2.line(frame_out, (x_pos - 10, anchor_y), (x_pos + 10, anchor_y), color, 1)
+                cv2.line(frame_out, (x_pos, anchor_y - 10), (x_pos, anchor_y + 10), color, 1)
+
             cv2.putText(frame_out, f"Yaw: {self._current_yaw:.1f} deg",
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            cv2.putText(frame_out,
-                f"dx: {dx_final:.1f}px  err: {correction_deg:.2f}deg",
-                (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+            cv2.putText(frame_out, f"dx: {dx_final:.1f}px  (ref: {self._reference_yaw:.1f})",
+                        (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
 
         # ------------------------------------------------------------------
         # Publish

@@ -27,6 +27,9 @@ Selective annotation control:
 
 Tuning:
   ros2 launch stabilization_pkg demo_rs_yaw_launch.py compass_lag_frames:=5
+  ros2 launch stabilization_pkg demo_rs_yaw_launch.py reference_alpha:=0.12 (faster return)
+  ros2 launch stabilization_pkg demo_rs_yaw_launch.py p_gain:=0.8
+  ros2 launch stabilization_pkg demo_rs_yaw_launch.py d_gain:=0.3 (more damping)
   ros2 launch stabilization_pkg demo_rs_yaw_launch.py max_margin_px:=100
 """
 
@@ -72,6 +75,9 @@ def generate_launch_description():
         DeclareLaunchArgument('max_shift_pct',      default_value='0.10'),
         DeclareLaunchArgument('max_margin_px',      default_value='80'),
         DeclareLaunchArgument('yaw_lag_frames',     default_value='0'),
+        DeclareLaunchArgument('reference_alpha',    default_value='0.08'),
+        DeclareLaunchArgument('p_gain',             default_value='1.0'),
+        DeclareLaunchArgument('d_gain',             default_value='0.2'),
         # Per-node annotation control
         DeclareLaunchArgument('rs_annotations',     default_value='true'),
         DeclareLaunchArgument('yaw_annotations',    default_value='true'),
@@ -120,7 +126,7 @@ def generate_launch_description():
         ),
 
         # ----------------------------------------------------------------
-        # 3. Yaw stabilizer (follow-at-margin control)
+        # 3. Yaw stabilizer (EMA + PD control)
         #    → /yaw_stabilized/compressed  (960×720, 4:3)
         # ----------------------------------------------------------------
         Node(
@@ -129,10 +135,13 @@ def generate_launch_description():
             name='yaw_stabilizer',
             output='screen',
             parameters=[{
-                'fov_horizontal_deg':  130.0,
+                'fov_horizontal_deg':  100.0,
                 'max_margin_px':       LaunchConfiguration('max_margin_px'),
                 'out_w':               960,
                 'yaw_lag_frames':      LaunchConfiguration('yaw_lag_frames'),
+                'reference_alpha':     LaunchConfiguration('reference_alpha'),
+                'p_gain':              LaunchConfiguration('p_gain'),
+                'd_gain':              LaunchConfiguration('d_gain'),
                 'show_annotations':    LaunchConfiguration('yaw_annotations'),
             }]
         ),

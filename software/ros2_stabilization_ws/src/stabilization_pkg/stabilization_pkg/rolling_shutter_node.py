@@ -332,17 +332,19 @@ class RollingShutterNode(Node):
                 avg_slope = (sum(self._slope_history) / len(self._slope_history)
                              if self._slope_history else 0.0)
 
-                # Green horizontal reference lines — both panels
+                # Green vertical reference lines — both panels (at quarter points)
                 for panel in (orig_small, corr_small):
-                    cv2.line(panel, (0, 5),          (half_w - 1, 5),          (0, 220, 0), 1)
-                    cv2.line(panel, (0, half_h - 5), (half_w - 1, half_h - 5), (0, 220, 0), 1)
+                    cv2.line(panel, (half_w // 4, 0),     (half_w // 4, half_h - 1),     (0, 220, 0), 1)
+                    cv2.line(panel, (3 * half_w // 4, 0), (3 * half_w // 4, half_h - 1), (0, 220, 0), 1)
 
-                # Yellow slope indicator on orig_small (tilted due to RS distortion)
+                # Yellow slope indicator on orig_small — pivots from center
                 mid_x = half_w // 2
+                mid_y = half_h // 2
                 total_shift = int(avg_slope * (half_h - 1))
+                half_shift = total_shift / 2.0
                 cv2.line(orig_small,
-                         (mid_x, 5),
-                         (mid_x + total_shift, half_h - 5),
+                         (int(mid_x - half_shift), 5),
+                         (int(mid_x + half_shift), half_h - 5),
                          (0, 255, 255), 2)
 
                 # Yellow vertical line on corr_small (perfectly corrected)
