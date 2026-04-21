@@ -1,30 +1,36 @@
 """
 Demo Launch — Rolling Shutter + Yaw Stabilization (Annotated)
 
-Full annotated pipeline for inspection and diagnostics:
-  Camera → rolling_shutter_node (compass mode) → yaw_stabilizer → /yaw_stabilized/compressed
+Full annotated pipeline with all comparison views:
 
-Two viewers:
-  - /rs_comparison/compressed  — side-by-side RS correction with slope lines
-  - /yaw_stabilized/compressed — 4:3 cropped yaw-stabilized output with overlays
+  Camera → rolling_shutter_node → yaw_stabilizer → yaw_stabilized
+         ↓                      ↓                ↓
+  /camera/raw   /rs_comparison  /rs_corrected    /yaw_stabilized
+                                                       ↓
+                                              demo_comparison_node
+                                           → /demo_comparison        (raw | yaw, 2-panel)
+                                           → /demo_full_pipeline     (raw | rs | yaw, 3-panel)
+
+Viewers launched:
+  - /rs_comparison/compressed      side-by-side RS correction with slope lines
+  - /demo_full_pipeline/compressed 3-panel end-to-end pipeline view (half-size)
 
 To run (annotated, default):
   ros2 launch stabilization_pkg demo_rs_yaw_launch.py
 
-For clean output without any overlays use:
+For clean output without annotations use:
   ros2 launch stabilization_pkg demo_rs_yaw_clean_launch.py
 
-Or disable annotations selectively:
+Selective annotation control:
   ros2 launch stabilization_pkg demo_rs_yaw_launch.py rs_annotations:=false
   ros2 launch stabilization_pkg demo_rs_yaw_launch.py yaw_annotations:=false
-  ros2 launch stabilization_pkg demo_rs_yaw_launch.py rs_annotations:=false yaw_annotations:=false
 
-Other tuning:
-  ros2 launch stabilization_pkg demo_rs_yaw_launch.py gimbal_port:=/dev/ttyACM1
+Tuning:
   ros2 launch stabilization_pkg demo_rs_yaw_launch.py compass_lag_frames:=5
-  ros2 launch stabilization_pkg demo_rs_yaw_launch.py max_shift_pct:=0.05
+  ros2 launch stabilization_pkg demo_rs_yaw_launch.py reference_alpha:=0.01
+  ros2 launch stabilization_pkg demo_rs_yaw_launch.py p_gain:=0.8
+  ros2 launch stabilization_pkg demo_rs_yaw_launch.py d_gain:=0.2
   ros2 launch stabilization_pkg demo_rs_yaw_launch.py max_margin_px:=100
-  ros2 launch stabilization_pkg demo_rs_yaw_launch.py yaw_lag_frames:=4
 """
 
 import subprocess
@@ -36,21 +42,18 @@ from launch_ros.actions import Node
 
 
 def _find_mobius_device(fallback: str = '/dev/video4') -> str:
-    """Return the first /dev/videoX listed under the 'Mobius' entry in v4l2-ctl."""
     try:
         out = subprocess.check_output(
-            ['v4l2-ctl', '--list-devices'],
-            stderr=subprocess.DEVNULL, text=True
-        )
-        in_mobius_block = False
+            ['v4l2-ctl', '--list-devices'], stderr=subprocess.DEVNULL, text=True)
+        in_block = False
         for line in out.splitlines():
             if 'mobius' in line.lower():
-                in_mobius_block = True
-            elif in_mobius_block:
-                stripped = line.strip()
-                if stripped.startswith('/dev/video'):
-                    return stripped
-                elif stripped and not stripped.startswith('/dev/'):
+                in_block = True
+            elif in_block:
+                s = line.strip()
+                if s.startswith('/dev/video'):
+                    return s
+                elif s and not s.startswith('/dev/'):
                     break
     except Exception:
         pass
@@ -65,28 +68,23 @@ def generate_launch_description():
         # ----------------------------------------------------------------
         # Launch arguments
         # ----------------------------------------------------------------
-        DeclareLaunchArgument('video_device',       default_value=_MOBIUS_DEVICE,
-                              description='V4L2 device path for Mobius camera (auto-detected)'),
-        DeclareLaunchArgument('gimbal_port',        default_value='/dev/ttyACM0',
-                              description='Serial port for the Storm BCG gimbal'),
-        DeclareLaunchArgument('compass_delay_sec',  default_value='0.0',
-                              description='Seconds to look back in gimbal history for frame sync'),
-        DeclareLaunchArgument('max_shift_pct',      default_value='0.10',
-                              description='Max RS correction as fraction of frame width'),
-        DeclareLaunchArgument('compass_lag_frames', default_value='4',
-                              description='Frame buffer for gimbal magnetometer lag (~133ms)'),
-        DeclareLaunchArgument('max_margin_px',      default_value='80',
-                              description='Max crop-center shift for yaw stabilization (px)'),
-        DeclareLaunchArgument('yaw_lag_frames',     default_value='0',
-                              description='Frame buffer for yaw stabilizer gimbal lag (frames)'),
-        # Annotation controls — per node
-        DeclareLaunchArgument('rs_annotations',     default_value='true',
-                              description='Show slope lines + shift text in RS comparison'),
-        DeclareLaunchArgument('yaw_annotations',    default_value='true',
-                              description='Show anchor circle + yaw text on yaw stabilizer output'),
+        DeclareLaunchArgument('video_device',       default_value=_MOBIUS_DEVICE),
+        DeclareLaunchArgument('gimbal_port',        default_value='/dev/ttyACM0'),
+        DeclareLaunchArgument('compass_delay_sec',  default_value='0.0'),
+        DeclareLaunchArgument('compass_lag_frames', default_value='4'),
+        DeclareLaunchArgument('max_shift_pct',      default_value='0.10'),
+        DeclareLaunchArgument('max_margin_px',      default_value='80'),
+        DeclareLaunchArgument('yaw_lag_frames',     default_value='0'),
+        DeclareLaunchArgument('reference_alpha',    default_value='0.02'),
+        DeclareLaunchArgument('p_gain',             default_value='1.0'),
+        DeclareLaunchArgument('d_gain',             default_value='0.0'),
+        # Per-node annotation control
+        DeclareLaunchArgument('rs_annotations',     default_value='true'),
+        DeclareLaunchArgument('yaw_annotations',    default_value='true'),
+        DeclareLaunchArgument('cmp_annotations',    default_value='true'),
 
         # ----------------------------------------------------------------
-        # 1. Gimbal serial reader
+        # 1. Gimbal serial reader → /gimbal/angles
         # ----------------------------------------------------------------
         Node(
             package='stabilization_pkg',
@@ -100,10 +98,10 @@ def generate_launch_description():
         ),
 
         # ----------------------------------------------------------------
-        # 2. Rolling shutter — compass mode, direct capture
-        #    Publishes:
-        #      /rs_corrected_frame/compressed  (clean frame for yaw_stabilizer)
-        #      /rs_comparison/compressed       (side-by-side for display)
+        # 2. Rolling shutter node
+        #    → /camera/raw/compressed        (raw, lag-aligned)
+        #    → /rs_corrected_frame/compressed (clean corrected)
+        #    → /rs_comparison/compressed     (side-by-side with slope lines)
         # ----------------------------------------------------------------
         Node(
             package='stabilization_pkg',
@@ -128,9 +126,8 @@ def generate_launch_description():
         ),
 
         # ----------------------------------------------------------------
-        # 3. Yaw stabilizer — physics-based sliding crop
-        #    Input:  /rs_corrected_frame/compressed
-        #    Output: /yaw_stabilized/compressed (960×720, 4:3)
+        # 3. Yaw stabilizer (EMA + PD + tanh soft clamping)
+        #    → /yaw_stabilized/compressed  (960×720, 4:3)
         # ----------------------------------------------------------------
         Node(
             package='stabilization_pkg',
@@ -140,24 +137,46 @@ def generate_launch_description():
             parameters=[{
                 'fov_horizontal_deg':  150.0,
                 'max_margin_px':       LaunchConfiguration('max_margin_px'),
+                'out_w':               960,
                 'yaw_lag_frames':      LaunchConfiguration('yaw_lag_frames'),
+                'reference_alpha':     LaunchConfiguration('reference_alpha'),
+                'p_gain':              LaunchConfiguration('p_gain'),
+                'd_gain':              LaunchConfiguration('d_gain'),
                 'show_annotations':    LaunchConfiguration('yaw_annotations'),
             }]
         ),
 
         # ----------------------------------------------------------------
-        # 4. Viewers
+        # 4. Demo comparison node
+        #    → /demo_comparison/compressed      (raw | yaw, 2-panel)
+        #    → /demo_full_pipeline/compressed   (raw | rs | yaw, 3-panel half-size)
         # ----------------------------------------------------------------
+        Node(
+            package='stabilization_pkg',
+            executable='demo_comparison_node',
+            name='demo_comparison_node',
+            output='screen',
+            parameters=[{
+                'out_w':            960,
+                'show_annotations': LaunchConfiguration('cmp_annotations'),
+            }]
+        ),
+
+        # ----------------------------------------------------------------
+        # 5. Viewers
+        # ----------------------------------------------------------------
+        # RS correction side-by-side (with slope lines)
         Node(
             package='rqt_image_view',
             executable='rqt_image_view',
             name='rs_viewer',
             arguments=['/rs_comparison/compressed']
         ),
+        # Full 3-panel pipeline comparison
         Node(
             package='rqt_image_view',
             executable='rqt_image_view',
-            name='yaw_viewer',
-            arguments=['/yaw_stabilized/compressed']
+            name='pipeline_viewer',
+            arguments=['/demo_full_pipeline/compressed']
         ),
     ])

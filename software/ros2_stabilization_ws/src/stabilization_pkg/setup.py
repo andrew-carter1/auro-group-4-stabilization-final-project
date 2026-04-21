@@ -33,6 +33,7 @@ setup(
             'gimbal_node = stabilization_pkg.gimbal_node:main',
             'rolling_shutter_node = stabilization_pkg.rolling_shutter_node:main',
             'yaw_stabilizer = stabilization_pkg.yaw_stabilizer:main',
+            'demo_comparison_node = stabilization_pkg.demo_comparison_node:main',
         ],
     },
 )

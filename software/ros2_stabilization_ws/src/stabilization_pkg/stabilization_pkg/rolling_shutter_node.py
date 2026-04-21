@@ -220,7 +220,7 @@ class RollingShutterNode(Node):
             )
 
         # ------------------------------------------------------------------
-        # Output publisher
+        # Output publishers
         # ------------------------------------------------------------------
         if self._input_mode == 'raw':
             self._pub = self.create_publisher(Image, '/rs_corrected_frame/image_raw', 10)
@@ -233,6 +233,13 @@ class RollingShutterNode(Node):
             self._comparison_pub = self.create_publisher(
                 CompressedImage, '/rs_comparison/compressed', 10
             ) if self._show_comparison else None
+
+        # Raw camera frame publisher — the frame as captured, before any RS processing.
+        # Published after the lag buffer so it is temporally aligned with rs_corrected_frame.
+        # Used by demo_comparison_node for end-to-end before/after display.
+        self._raw_pub = self.create_publisher(
+            CompressedImage, '/camera/raw/compressed', 10
+        ) if self._input_mode == 'capture' else None
 
         self.get_logger().info(
             f"Rolling shutter node started — input_mode='{self._input_mode}', "
@@ -286,6 +293,15 @@ class RollingShutterNode(Node):
             if len(self._frame_buffer) <= self._lag_frames:
                 return  # still filling buffer
             frame, frame_time = self._frame_buffer.popleft()
+
+        # Publish raw frame (temporally aligned with processed output after lag buffer)
+        if self._raw_pub is not None:
+            _, raw_buf = cv2.imencode('.jpg', frame)
+            raw_msg = CompressedImage()
+            raw_msg.header.stamp = self.get_clock().now().to_msg()
+            raw_msg.format = 'jpeg'
+            raw_msg.data = np.array(raw_buf).tobytes()
+            self._raw_pub.publish(raw_msg)
 
         corrected = self._process_frame(frame, frame_time)
         if corrected is None:
