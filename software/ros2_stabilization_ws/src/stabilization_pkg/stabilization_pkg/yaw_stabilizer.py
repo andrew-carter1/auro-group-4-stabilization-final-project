@@ -18,7 +18,7 @@ Stabilization logic:
   5. Output is a 4:3 center-cropped sliding window (out_w × h, default 960 × input_h).
 
 Parameters:
-  fov_horizontal_deg (float): camera horizontal FOV. Default 150.0 (Mobius).
+  fov_horizontal_deg (float): camera horizontal FOV. Default 130.0 (Mobius).
   max_margin_px (int):        half-width of crop headroom in pixels. Default 80.
                               At 1280 wide: output is 1280 - 2*80 = 1120 px (or set out_w directly).
   out_w (int):                explicit output crop width. Default 960 (4:3 at 720h).

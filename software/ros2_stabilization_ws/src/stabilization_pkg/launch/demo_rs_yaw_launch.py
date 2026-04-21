@@ -71,7 +71,7 @@ def generate_launch_description():
         DeclareLaunchArgument('video_device',       default_value=_MOBIUS_DEVICE),
         DeclareLaunchArgument('gimbal_port',        default_value='/dev/ttyACM0'),
         DeclareLaunchArgument('compass_delay_sec',  default_value='0.0'),
-        DeclareLaunchArgument('compass_lag_frames', default_value='4'),
+        DeclareLaunchArgument('compass_lag_frames', default_value='1'),
         DeclareLaunchArgument('max_shift_pct',      default_value='0.10'),
         DeclareLaunchArgument('max_margin_px',      default_value='80'),
         DeclareLaunchArgument('yaw_lag_frames',     default_value='0'),
@@ -111,7 +111,7 @@ def generate_launch_description():
             parameters=[{
                 'input_mode':          'capture',
                 'mode':                'compass',
-                'fov_horizontal_deg':  150.0,
+                'fov_horizontal_deg':  130.0,
                 'video_device':        LaunchConfiguration('video_device'),
                 'image_width':         1280,
                 'image_height':        720,
@@ -135,7 +135,7 @@ def generate_launch_description():
             name='yaw_stabilizer',
             output='screen',
             parameters=[{
-                'fov_horizontal_deg':  150.0,
+                'fov_horizontal_deg':  130.0,
                 'max_margin_px':       LaunchConfiguration('max_margin_px'),
                 'out_w':               960,
                 'yaw_lag_frames':      LaunchConfiguration('yaw_lag_frames'),

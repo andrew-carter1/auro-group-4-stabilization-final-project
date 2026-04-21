@@ -103,7 +103,7 @@ def generate_launch_description():
     )
     lag_frames_arg = DeclareLaunchArgument(
         'compass_lag_frames',
-        default_value='4',
+        default_value='1',
         description='Frames to buffer for compass-video sync (0=no buffer)'
     )
 
@@ -135,7 +135,7 @@ def generate_launch_description():
             parameters=[{
                 'input_mode':          'capture',
                 'mode':                'compass',
-                'fov_horizontal_deg':  150.0,
+                'fov_horizontal_deg':  130.0,
                 'video_device':        LaunchConfiguration('video_device'),
                 'image_width':         1280,
                 'image_height':        720,
