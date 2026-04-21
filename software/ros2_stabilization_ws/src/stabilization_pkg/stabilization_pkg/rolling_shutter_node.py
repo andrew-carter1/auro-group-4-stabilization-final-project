@@ -189,12 +189,12 @@ class RollingShutterNode(Node):
 
         # Gimbal yaw history: deque of (timestamp_sec, yaw_deg), newest at right.
         # Yaw is continuous — NOT wrapped at ±360°
-        # Sized to hold ~10 s of 30 Hz data so the delay buffer can look back far.
-        self._yaw_history: deque = deque(maxlen=300)
+        # Sized to hold ~10 s of 60 Hz data so the delay buffer can look back far.
+        self._yaw_history: deque = deque(maxlen=600)
 
         # Store applied slope for comparison frame overlay
         self._last_slope = 0.0  # px/row
-        self._slope_history: deque = deque(maxlen=2)  # for smoothing overlay display
+        self._slope_history: deque = deque(maxlen=3)  # 3-frame weighted averaging for overlay display
 
         if self._mode == 'compass':
             self.create_subscription(
@@ -328,9 +328,15 @@ class RollingShutterNode(Node):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
             if self._show_annotations:
-                # Compute averaged slope for smoother overlay display
-                avg_slope = (sum(self._slope_history) / len(self._slope_history)
-                             if self._slope_history else 0.0)
+                # Compute weighted average of slope: 50% recent, 30% middle, 20% oldest
+                if len(self._slope_history) == 3:
+                    avg_slope = 0.50 * self._slope_history[2] + 0.30 * self._slope_history[1] + 0.20 * self._slope_history[0]
+                elif len(self._slope_history) == 2:
+                    avg_slope = 0.60 * self._slope_history[1] + 0.40 * self._slope_history[0]
+                elif self._slope_history:
+                    avg_slope = self._slope_history[0]
+                else:
+                    avg_slope = 0.0
 
                 # Green vertical reference lines — both panels (at quarter points)
                 for panel in (orig_small, corr_small):

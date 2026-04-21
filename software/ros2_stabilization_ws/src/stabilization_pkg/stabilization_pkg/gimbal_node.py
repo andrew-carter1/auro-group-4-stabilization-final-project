@@ -39,10 +39,9 @@ class GimbalNode(Node):
     HEADER = 0x3E
     CMD_REALTIME_DATA = 0x44
 
-    # Timeout short enough to keep up with 30 Hz (33 ms per cycle).
-    # At 115200 baud a ~68-byte response takes ~5 ms, so 25 ms leaves margin.
-    # To run at 60 Hz: change to 0.015 (15 ms timeout)
-    SERIAL_TIMEOUT = 0.025
+    # Timeout short enough to keep up with 60 Hz (16.7 ms per cycle).
+    # At 115200 baud a ~68-byte response takes ~5 ms, so 15 ms leaves margin.
+    SERIAL_TIMEOUT = 0.015
 
     def __init__(self):
         super().__init__('gimbal_node')
@@ -61,8 +60,8 @@ class GimbalNode(Node):
         self.ser       = None
         self._connect()
 
-        # To run at 60 Hz: change divisor to 60.0 (and SERIAL_TIMEOUT to 0.015)
-        self.create_timer(1.0 / 30.0, self.timer_cb)
+        # Running at 60 Hz
+        self.create_timer(1.0 / 60.0, self.timer_cb)
 
     def _connect(self) -> bool:
         """

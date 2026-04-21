@@ -77,7 +77,7 @@ def generate_launch_description():
         DeclareLaunchArgument('yaw_lag_frames',     default_value='0'),
         DeclareLaunchArgument('reference_alpha',    default_value='0.08'),
         DeclareLaunchArgument('p_gain',             default_value='1.0'),
-        DeclareLaunchArgument('d_gain',             default_value='0.2'),
+        DeclareLaunchArgument('d_gain',             default_value='0.3'),
         # Per-node annotation control
         DeclareLaunchArgument('rs_annotations',     default_value='true'),
         DeclareLaunchArgument('yaw_annotations',    default_value='true'),

@@ -12,7 +12,7 @@ Stabilization logic:
      Higher alpha = faster return to center (more aggressive jitter rejection).
   2. Correction = (reference_yaw - current_yaw) → converted to pixels via fisheye model.
   3. P gain scales the correction; D gain damps rapid dx changes (prevents oscillation).
-  4. dx is averaged over the last 2 frames for smooth motion.
+  4. dx is averaged over the last 3 frames (50% recent, 30% middle, 20% oldest) for smooth motion.
   5. Output is a 4:3 center-cropped sliding window (out_w × h, default 960 × input_h).
 
 Parameters:
@@ -80,11 +80,11 @@ class YawStabilizer(Node):
         self._current_yaw  = 0.0
         self._reference_yaw = None   # initialised on first gimbal reading
         self._prev_dx_raw  = 0.0    # for D term
-        self._dx_history: deque = deque(maxlen=2)  # for 2-frame averaging
+        self._dx_history: deque = deque(maxlen=3)  # for 3-frame weighted averaging
         self._frame_buffer: deque = deque()
 
         self.get_logger().info(
-            f"Yaw stabilizer started — EMA + PD, "
+            f"Yaw stabilizer started — EMA + PD with 3-frame weighted averaging, "
             f"ref_alpha={self._ref_alpha}, p={self._p_gain}, d={self._d_gain}, "
             f"margin={self._max_margin_px}px, out_w={self._out_w}"
         )
@@ -151,10 +151,12 @@ class YawStabilizer(Node):
         m = float(self._max_margin_px)
         dx_controlled = max(-m, min(m, dx_controlled))
 
-        # Average dx over 2 frames: 66% current, 33% previous (weighted for responsiveness)
+        # Average dx over 3 frames: 50% recent, 30% middle, 20% oldest (weighted for responsiveness)
         self._dx_history.append(dx_controlled)
-        if len(self._dx_history) == 2:
-            dx_final = 0.66 * self._dx_history[1] + 0.34 * self._dx_history[0]
+        if len(self._dx_history) == 3:
+            dx_final = 0.80 * self._dx_history[2] + 0.15 * self._dx_history[1] + 0.05 * self._dx_history[0]
+        elif len(self._dx_history) == 2:
+            dx_final = 0.60 * self._dx_history[1] + 0.40 * self._dx_history[0]
         elif self._dx_history:
             dx_final = self._dx_history[0]
         else:
@@ -168,22 +170,38 @@ class YawStabilizer(Node):
         frame_out = frame[:, x0:x0 + out_w].copy()
 
         # ------------------------------------------------------------------
-        # Annotations: three crosshairs at 0.25w, 0.5w, 0.75w to show fisheye effect
+        # Annotations: three crosshairs at fixed INPUT positions (0.25w, 0.5w, 0.75w)
+        # Mapped to output coords — dots move as crop window slides
         # ------------------------------------------------------------------
         if self._show_annotations:
             anchor_y = h // 2
 
-            # Draw crosshairs at three positions: left, center, right
+            # Crosshairs at fixed input frame positions, mapped to output coordinates
             for frac, color in [(0.25, (100, 100, 255)), (0.50, (0, 255, 255)), (0.75, (255, 100, 100))]:
-                x_pos = int(frac * out_w)
-                cv2.circle(frame_out, (x_pos, anchor_y), 6, color, 2)
-                cv2.line(frame_out, (x_pos - 10, anchor_y), (x_pos + 10, anchor_y), color, 1)
-                cv2.line(frame_out, (x_pos, anchor_y - 10), (x_pos, anchor_y + 10), color, 1)
+                input_x = int(frac * w)     # Fixed position in input frame
+                output_x = input_x - x0     # Map to output crop coordinates
+
+                # Only draw if visible in output window
+                if 0 <= output_x < out_w:
+                    cv2.circle(frame_out, (output_x, anchor_y), 6, color, 2)
+                    cv2.line(frame_out, (output_x - 10, anchor_y), (output_x + 10, anchor_y), color, 1)
+                    cv2.line(frame_out, (output_x, anchor_y - 10), (output_x, anchor_y + 10), color, 1)
 
             cv2.putText(frame_out, f"Yaw: {self._current_yaw:.1f} deg",
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             cv2.putText(frame_out, f"dx: {dx_final:.1f}px  (ref: {self._reference_yaw:.1f})",
                         (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+
+            # Debug: show dx history (most recent, 2nd, 3rd)
+            dx_str = "dx_hist: ["
+            if len(self._dx_history) >= 1:
+                dx_str += f"{self._dx_history[-1]:.1f}"
+            if len(self._dx_history) >= 2:
+                dx_str += f", {self._dx_history[-2]:.1f}"
+            if len(self._dx_history) >= 3:
+                dx_str += f", {self._dx_history[-3]:.1f}"
+            dx_str += "]"
+            cv2.putText(frame_out, dx_str, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1)
 
         # ------------------------------------------------------------------
         # Publish
