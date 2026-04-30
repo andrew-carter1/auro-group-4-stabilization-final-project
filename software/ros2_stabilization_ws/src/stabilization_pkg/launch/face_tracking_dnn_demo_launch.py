@@ -1,26 +1,18 @@
 #!/usr/bin/env python3
 """
-Face Tracking DNN Demo Launch (No Servo Control)
+Face Tracking DNN Demo Launch
 
-Direct camera capture pipeline with SSD face detector (from HW1):
-  1. face_detection_dnn_node — opens camera, runs SSD detector, publishes frames + /face/bbox
-  2. face_tracker — Kalman tracking, publishes pitch_cmd + yaw-cropped frames
-  3. rqt_image_view (×2) — visualizes detection and tracking output
-
-No UART, no gimbal servo commands. Good for:
-  - Testing SSD face detection quality (more robust than Haar Cascade)
-  - Tuning Kalman and PD parameters
-  - Debugging yaw crop behavior
-  - Monitoring pitch corrections
+Direct camera capture pipeline with SSD face detector and Kalman tracking:
+  1. face_detection_dnn_node — opens camera, runs SSD detector, publishes /face/bbox
+  2. face_tracker — Kalman filtering + yaw crop, publishes /face_tracked/compressed + /face_tracker/pitch_cmd
+  3. uart_gimbal_servo — sends pitch commands to gimbal servo (gracefully handles missing ESP32)
+  4. rqt_image_view — visualizes tracked output
 
 To run:
   ros2 launch stabilization_pkg face_tracking_dnn_demo_launch.py
 
 Or with custom camera device:
   ros2 launch stabilization_pkg face_tracking_dnn_demo_launch.py video_device:=/dev/video0
-
-Monitor pitch correction:
-  python3 software/monitor_pitch_cmd.py
 
 Tune SSD confidence threshold:
   ros2 launch stabilization_pkg face_tracking_dnn_demo_launch.py confidence_threshold:=0.6
@@ -73,6 +65,46 @@ def generate_launch_description():
             'confidence_threshold',
             default_value='0.5',
             description='SSD detector confidence threshold (0.0-1.0)'),
+
+        DeclareLaunchArgument(
+            'fov_horizontal_deg',
+            default_value='100.0',
+            description='Camera horizontal FOV (degrees)'),
+
+        DeclareLaunchArgument(
+            'face_track_out_w',
+            default_value='720',
+            description='Output crop width (square format, 720×720 pixels)'),
+
+        DeclareLaunchArgument(
+            'face_track_p_gain',
+            default_value='2.0',
+            description='Yaw crop proportional gain'),
+
+        DeclareLaunchArgument(
+            'face_track_d_gain',
+            default_value='0.3',
+            description='Yaw crop derivative damping'),
+
+        DeclareLaunchArgument(
+            'kalman_std_acc',
+            default_value='30.0',
+            description='Kalman filter accel noise (deg/s²)'),
+
+        DeclareLaunchArgument(
+            'kalman_std_meas',
+            default_value='5.0',
+            description='Kalman filter measurement noise (deg)'),
+
+        DeclareLaunchArgument(
+            'show_annotations',
+            default_value='true',
+            description='Show yaw/pitch values on output frames'),
+
+        DeclareLaunchArgument(
+            'esp32_port',
+            default_value='/dev/ttyUSB0',
+            description='Serial port for ESP32 (optional, gracefully skipped if not connected)'),
 
         DeclareLaunchArgument(
             'fov_horizontal_deg',
@@ -151,7 +183,21 @@ def generate_launch_description():
             }],
         ),
 
-        # 3. Image viewer for tracking output
+        # 3. UART Gimbal Servo (gracefully handles missing ESP32)
+        Node(
+            package='stabilization_pkg',
+            executable='uart_gimbal_servo',
+            name='uart_gimbal_servo',
+            output='screen',
+            parameters=[{
+                'port': LaunchConfiguration('esp32_port'),
+                'baudrate': 115200,
+                'min_deg': -40.0,
+                'max_deg': 40.0,
+            }],
+        ),
+
+        # 4. Image viewer for tracking output
         Node(
             package='rqt_image_view',
             executable='rqt_image_view',

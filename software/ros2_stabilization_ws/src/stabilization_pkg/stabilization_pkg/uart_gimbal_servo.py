@@ -17,7 +17,7 @@ Mapping:
 import serial
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, String
 
 
 class UartGimbalServoNode(Node):
@@ -39,8 +39,17 @@ class UartGimbalServoNode(Node):
         self.ser = None
         self._connect()
 
+        # ------ State ------
+        self._latest_pitch_deg = 0.0
+
         # ------ Subscriptions ------
         self.create_subscription(Float32, '/face_tracker/pitch_cmd', self._pitch_cmd_cb, 10)
+
+        # ------ Publishers ------
+        self._echo_pub = self.create_publisher(String, '/uart_gimbal/esp32_echo', 10)
+
+        # ------ Timer: send at 10 Hz ------
+        self.create_timer(1.0 / 10.0, self._send_timer_cb)
 
         self.get_logger().info(
             f"UART Gimbal Servo started on {self._port} @ {self._baudrate} baud, "
@@ -77,18 +86,24 @@ class UartGimbalServoNode(Node):
         return duty
 
     def _pitch_cmd_cb(self, msg: Float32):
-        """Receive pitch command and send to ESP32."""
+        """Store latest pitch command (sent by timer at 10 Hz)."""
+        self._latest_pitch_deg = msg.data
+
+    def _send_timer_cb(self):
+        """Send pitch command to ESP32 at 10 Hz."""
         if not self.ser or not self.ser.is_open:
             if not self._connect():
                 return
 
-        pitch_deg = msg.data
-        duty = self._deg_to_duty(pitch_deg)
+        duty = self._deg_to_duty(self._latest_pitch_deg)
 
         # Send command
         try:
             cmd = f"P:{duty:.1f}\n"
             self.ser.write(cmd.encode())
+
+            # Read echo response from ESP32
+            self._read_esp32_echo()
         except serial.SerialException as e:
             self.get_logger().warn(
                 f"Serial write error: {e}. Will attempt reconnect.",
@@ -96,6 +111,19 @@ class UartGimbalServoNode(Node):
             )
             self.ser.close()
             self.ser = None
+
+    def _read_esp32_echo(self):
+        """Read and publish ESP32 echo response."""
+        try:
+            # Read until newline or timeout
+            echo_data = self.ser.readline().decode('utf-8', errors='ignore').strip()
+            if echo_data:
+                # Publish to ROS2 topic
+                msg = String(data=echo_data)
+                self._echo_pub.publish(msg)
+                self.get_logger().debug(f"ESP32 echo: {echo_data}")
+        except Exception as e:
+            self.get_logger().debug(f"Failed to read echo: {e}", throttle_duration_sec=5.0)
 
     def destroy_node(self):
         """Close serial connection on shutdown."""
