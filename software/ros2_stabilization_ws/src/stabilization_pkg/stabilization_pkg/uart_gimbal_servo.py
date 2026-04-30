@@ -72,8 +72,8 @@ class UartGimbalServoNode(Node):
         # Clamp to valid range
         deg_clamped = max(self._min_deg, min(self._max_deg, deg))
 
-        # Linear mapping: min_deg → 0%, max_deg → 100%
-        duty = ((deg_clamped - self._min_deg) / (self._max_deg - self._min_deg)) * 100.0
+        # Inverted mapping: +45° (face below) → 0%, -45° (face above) → 100%
+        duty = ((self._max_deg - deg_clamped) / (self._max_deg - self._min_deg)) * 100.0
         return duty
 
     def _pitch_cmd_cb(self, msg: Float32):

@@ -30,6 +30,7 @@ setup(
             'realtime_stabilization = stabilization_pkg.realtime_stabilization:main',
             'stabilization_node = stabilization_pkg.stabilization_node:main',
             'face_detection_node = stabilization_pkg.face_detection_node:main',
+            'face_detection_dnn_node = stabilization_pkg.face_detection_dnn_node:main',
             'gimbal_node = stabilization_pkg.gimbal_node:main',
             'rolling_shutter_node = stabilization_pkg.rolling_shutter_node:main',
             'yaw_stabilizer = stabilization_pkg.yaw_stabilizer:main',
