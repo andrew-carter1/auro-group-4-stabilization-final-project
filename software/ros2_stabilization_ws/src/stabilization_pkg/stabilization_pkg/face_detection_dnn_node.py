@@ -76,28 +76,18 @@ class FaceDetectionDNNNode(Node):
         self.create_timer(1.0 / self.fps, self._capture_and_detect)
 
     def _find_ssd_models(self):
-        """Find SSD model files from HW1 or local package."""
-        # Try package-local first
+        """Find SSD model files in package."""
         package_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         proto_path = os.path.join(package_path, 'models', 'deploy.prototxt')
         model_path = os.path.join(package_path, 'models', 'res10_300x300_ssd_iter_140000.caffemodel')
 
-        if os.path.exists(proto_path) and os.path.exists(model_path):
-            return proto_path, model_path
-
-        # Fall back to HW1
-        hw1_proto = os.path.expanduser('~/Documents/Spring_2026/Auto_Robot_5934/Assignments/HW1/hw1_ws/src/hw1_package/models/deploy.prototxt')
-        hw1_model = os.path.expanduser('~/Documents/Spring_2026/Auto_Robot_5934/Assignments/HW1/hw1_ws/src/hw1_package/models/res10_300x300_ssd_iter_140000.caffemodel')
-
-        if os.path.exists(hw1_proto) and os.path.exists(hw1_model):
-            self.get_logger().info(f"Using HW1 model files")
-            return hw1_proto, hw1_model
-
-        raise RuntimeError(
-            f"SSD model files not found. Checked:\n"
-            f"  {proto_path}\n"
-            f"  {hw1_proto}"
-        )
+        if not os.path.exists(proto_path) or not os.path.exists(model_path):
+            raise RuntimeError(
+                f"SSD model files not found:\n"
+                f"  {proto_path}\n"
+                f"  {model_path}"
+            )
+        return proto_path, model_path
 
     def _capture_and_detect(self):
         """Capture frame, detect faces via SSD, publish results."""
