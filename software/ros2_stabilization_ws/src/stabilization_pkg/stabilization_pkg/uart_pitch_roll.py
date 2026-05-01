@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-UART Gimbal Servo Control via ESP32
+UART Gimbal Pitch/Roll Motor Control via ESP32
 
 Subscribes to:
   /face_tracker/pitch_cmd  — pitch command in degrees [-45, +45]
 
-Sends UART commands to ESP32 that drives the gimbal pitch servo:
+Sends UART commands to ESP32 that drives the gimbal pitch brushless motor:
   "P:{duty:.1f}\n"  where duty is 0.0–100.0 (percentage)
 
 Mapping:
@@ -20,9 +20,9 @@ from rclpy.node import Node
 from std_msgs.msg import Float32, String
 
 
-class UartGimbalServoNode(Node):
+class UartPitchRollNode(Node):
     def __init__(self):
-        super().__init__('uart_gimbal_servo')
+        super().__init__('uart_pitch_roll')
 
         # ------ Parameters ------
         self.declare_parameter('port', '/dev/ttyUSB0')
@@ -54,7 +54,7 @@ class UartGimbalServoNode(Node):
         self.create_timer(1.0 / 10.0, self._send_timer_cb)
 
         self.get_logger().info(
-            f"UART Gimbal Servo started on {self._port} @ {self._baudrate} baud, "
+            f"UART Pitch/Roll motor control started on {self._port} @ {self._baudrate} baud, "
             f"range [{self._min_deg:.0f}, {self._max_deg:.0f}]°"
         )
 
@@ -156,7 +156,7 @@ class UartGimbalServoNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = UartGimbalServoNode()
+    node = UartPitchRollNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

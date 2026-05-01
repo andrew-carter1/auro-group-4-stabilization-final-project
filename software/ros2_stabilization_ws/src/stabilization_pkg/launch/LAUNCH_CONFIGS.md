@@ -5,12 +5,14 @@
 | Launch File | Purpose | Gimbal | Viewers | Key Nodes |
 |---|---|---|---|---|
 | `stabilization_launch.py` | Legacy: basic stabilization + face detection | ❌ | 1 | stabilization_node, face_detection_node |
-| `combined_launch.py` | Full USB camera + face detection pipeline | ❌ | 1 | usb_cam, stabilization_node, face_detection_node |
+| `combined_launch.py` | EMA stabilization + RS correction (optical flow, no gimbal) | ❌ | 1 | realtime_stabilization, rolling_shutter_node |
 | `rolling_shutter_compass_launch.py` | RS correction only (gimbal yaw driven) | ✅ | 1 | gimbal_node, rolling_shutter_node |
 | `rolling_shutter_compass_diagnostics_launch.py` | RS correction + diagnostics output | ✅ | 1 | gimbal_node, rolling_shutter_node |
 | `rolling_shutter_raw_test_launch.py` | RS correction via optical flow (no gimbal) | ❌ | 1 | rolling_shutter_node |
 | `demo_rs_yaw_launch.py` | Full RS + yaw stabilization (annotated) | ✅ | 2 | gimbal_node, rolling_shutter_node, yaw_stabilizer, demo_comparison_node |
 | `demo_rs_yaw_clean_launch.py` | Full RS + yaw stabilization (clean output) | ✅ | 1 | gimbal_node, rolling_shutter_node, yaw_stabilizer, demo_comparison_node |
+| `face_tracking_dnn_test_launch.py` | SSD face detection + Kalman tracking + motor control | ✅ | 1 | face_detection_dnn_node, face_tracker, uart_pitch_roll |
+| `face_tracking_dnn_demo_launch.py` | SSD face detection + proportional tracking (motor optional) | ⚠️ | 1 | face_detection_dnn_node, face_tracker, uart_pitch_roll |
 
 ---
 
@@ -202,6 +204,86 @@ reference_alpha          0.06        (updated from 0.08)
 
 ---
 
+### `face_tracking_dnn_test_launch.py`
+**Status**: Active (motor control testing variant)  
+**Gimbal Required**: ✅ ESP32 at `/dev/ttyUSB0`
+
+**Purpose**: Complete face detection → tracking → brushless motor control pipeline with full tuning parameters.
+
+**Tuning Arguments**:
+```
+video_device              /dev/video4 (auto-detected Mobius)
+servo_port               /dev/ttyUSB0
+confidence_threshold     0.5         (SSD detector confidence)
+fov_horizontal_deg       100.0       (camera FOV)
+face_track_out_w         720         (output crop width)
+face_track_p_gain        1.0         (yaw proportional gain)
+face_track_d_gain        0.2         (yaw derivative damping)
+kalman_std_acc           30.0        (Kalman filter accel noise)
+kalman_std_meas          5.0         (Kalman filter measurement noise)
+servo_min_deg            -45.0       (servo lower limit)
+servo_max_deg            45.0        (servo upper limit)
+show_annotations         true        (draw yaw/pitch on output)
+```
+
+**Output Topics**:
+- `/image_with_faces/compressed` — camera with detected faces (from face_detection_dnn_node)
+- `/face_tracked/compressed` — cropped/stabilized face output (from face_tracker)
+- `/face_tracker/pitch_cmd` — pitch command (to uart_gimbal_servo)
+
+**Viewers**: 1 (face_tracked output)
+
+**Nodes**:
+- face_detection_dnn_node (SSD detector, direct camera capture)
+- face_tracker (Kalman filtering + yaw crop + pitch control)
+- uart_pitch_roll (sends pitch commands to ESP32 brushless motor)
+- rqt_image_view
+
+**Notes**: Full-featured test configuration. Kalman parameters included but currently commented out in face_tracker.py; can be re-enabled for predictive tracking.
+
+---
+
+### `face_tracking_dnn_demo_launch.py`
+**Status**: Active (demo variant, motor control optional)  
+**Gimbal Required**: ⚠️ ESP32 optional (gracefully handles missing connection)
+
+**Purpose**: Simplified face detection + tracking for demo/visualization. Motor connection is optional.
+
+**Tuning Arguments** (subset of test_launch):
+```
+video_device              /dev/video4 (auto-detected Mobius)
+confidence_threshold     0.3         (lower threshold for demo)
+fov_horizontal_deg       100.0
+face_track_out_w         720
+face_track_p_gain        2.0         (higher gain for responsive demo)
+face_track_p_gain_pitch  0.5         (pitch gain)
+face_track_d_gain        0.3
+show_annotations         true
+esp32_port              /dev/ttyUSB0 (optional, gracefully skipped if missing)
+```
+
+**Output Topics**:
+- `/image_with_faces/compressed` — annotated camera frames
+- `/face_tracked/compressed` — cropped face output
+
+**Viewers**: 1 (face_tracked output)
+
+**Nodes**:
+- face_detection_dnn_node
+- face_tracker (proportional control, no Kalman)
+- uart_pitch_roll (non-fatal if ESP32 not connected)
+- rqt_image_view
+
+**Key Differences from Test Launch**:
+- Lower SSD confidence threshold (0.3 vs 0.5) — more detections
+- Higher P gains (yaw 2.0 vs 1.0) — more responsive tracking
+- No Kalman parameters (uses simple proportional control)
+- Motor connection is optional/graceful
+
+**Notes**: Best for live demos and visualization where gimbal may not be available.
+
+---
+
 ## Consistency Changes (2026-04-30)
 
 ### FOV Standardization
@@ -258,4 +340,16 @@ ros2 launch stabilization_pkg rolling_shutter_compass_launch.py compass_delay_se
 
 # Tune yaw stabilizer reference alpha (faster return)
 ros2 launch stabilization_pkg demo_rs_yaw_launch.py reference_alpha:=0.08
+
+# Face detection + tracking with servo control
+ros2 launch stabilization_pkg face_tracking_dnn_test_launch.py
+
+# Face detection + tracking demo (servo optional)
+ros2 launch stabilization_pkg face_tracking_dnn_demo_launch.py
+
+# Tune face detection confidence
+ros2 launch stabilization_pkg face_tracking_dnn_demo_launch.py confidence_threshold:=0.6
+
+# Tune face tracking proportional gains
+ros2 launch stabilization_pkg face_tracking_dnn_demo_launch.py face_track_p_gain:=1.5 face_track_p_gain_pitch:=0.8
 ```

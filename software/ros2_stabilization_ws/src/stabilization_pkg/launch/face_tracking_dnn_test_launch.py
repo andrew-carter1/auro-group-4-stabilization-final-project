@@ -2,10 +2,10 @@
 """
 Face Tracking DNN Test Launch (With Servo Control)
 
-Complete pipeline for SSD face detection + gimbal servo control:
+Complete pipeline for SSD face detection + gimbal motor control:
   1. face_detection_dnn_node — opens camera, runs SSD detector, publishes frames + /face/bbox
   2. face_tracker — Kalman tracking, publishes pitch_cmd + yaw-cropped frames
-  3. uart_gimbal_servo — sends PWM commands to ESP32 via UART
+  3. uart_pitch_roll — sends PWM commands to ESP32 via UART for pitch/roll brushless motors
   4. rqt_image_view (×2) — visualizes detection and tracking output
 
 Gimbal Required: ✅ ESP32 at /dev/ttyUSB0 for pitch servo
@@ -162,11 +162,11 @@ def generate_launch_description():
             }],
         ),
 
-        # 3. UART gimbal servo control
+        # 3. UART gimbal pitch/roll motor control
         Node(
             package='stabilization_pkg',
-            executable='uart_gimbal_servo',
-            name='uart_gimbal_servo',
+            executable='uart_pitch_roll',
+            name='uart_pitch_roll',
             output='screen',
             parameters=[{
                 'port': LaunchConfiguration('servo_port'),

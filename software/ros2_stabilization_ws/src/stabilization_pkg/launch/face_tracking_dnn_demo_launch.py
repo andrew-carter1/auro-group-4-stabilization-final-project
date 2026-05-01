@@ -2,10 +2,10 @@
 """
 Face Tracking DNN Demo Launch
 
-Direct camera capture pipeline with SSD face detector and Kalman tracking:
+Direct camera capture pipeline with SSD face detector and face tracking:
   1. face_detection_dnn_node — opens camera, runs SSD detector, publishes /face/bbox
-  2. face_tracker — Kalman filtering + yaw crop, publishes /face_tracked/compressed + /face_tracker/pitch_cmd
-  3. uart_gimbal_servo — sends pitch commands to gimbal servo (gracefully handles missing ESP32)
+  2. face_tracker — proportional control + yaw crop, publishes /face_tracked/compressed + /face_tracker/pitch_cmd
+  3. uart_pitch_roll — sends pitch commands to gimbal brushless motor (gracefully handles missing ESP32)
   4. rqt_image_view — visualizes tracked output
 
 To run:
@@ -184,11 +184,11 @@ def generate_launch_description():
             }],
         ),
 
-        # 3. UART Gimbal Servo (gracefully handles missing ESP32)
+        # 3. UART Pitch/Roll Motor (gracefully handles missing ESP32)
         Node(
             package='stabilization_pkg',
-            executable='uart_gimbal_servo',
-            name='uart_gimbal_servo',
+            executable='uart_pitch_roll',
+            name='uart_pitch_roll',
             output='screen',
             parameters=[{
                 'port': LaunchConfiguration('esp32_port'),

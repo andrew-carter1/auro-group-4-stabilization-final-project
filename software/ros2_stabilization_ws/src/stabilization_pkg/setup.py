@@ -36,7 +36,7 @@ setup(
             'yaw_stabilizer = stabilization_pkg.yaw_stabilizer:main',
             'demo_comparison_node = stabilization_pkg.demo_comparison_node:main',
             'face_tracker = stabilization_pkg.face_tracker:main',
-            'uart_gimbal_servo = stabilization_pkg.uart_gimbal_servo:main',
+            'uart_pitch_roll = stabilization_pkg.uart_pitch_roll:main',
         ],
     },
 )
