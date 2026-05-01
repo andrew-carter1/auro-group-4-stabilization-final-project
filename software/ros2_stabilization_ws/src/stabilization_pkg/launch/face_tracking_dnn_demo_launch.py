@@ -63,7 +63,7 @@ def generate_launch_description():
 
         DeclareLaunchArgument(
             'confidence_threshold',
-            default_value='0.5',
+            default_value='0.3',
             description='SSD detector confidence threshold (0.0-1.0)'),
 
         DeclareLaunchArgument(
@@ -80,6 +80,11 @@ def generate_launch_description():
             'face_track_p_gain',
             default_value='2.0',
             description='Yaw crop proportional gain'),
+
+        DeclareLaunchArgument(
+            'face_track_p_gain_pitch',
+            default_value='0.5',
+            description='Pitch proportional gain'),
 
         DeclareLaunchArgument(
             'face_track_d_gain',
@@ -173,13 +178,9 @@ def generate_launch_description():
                 'image_height': 720,
                 'out_w': LaunchConfiguration('face_track_out_w'),
                 'max_margin_px': 120,
-                'no_face_hold_sec': -1.0,
-                'p_gain': LaunchConfiguration('face_track_p_gain'),
-                'd_gain': LaunchConfiguration('face_track_d_gain'),
-                'dt': 0.033,
+                'p_gain_yaw': LaunchConfiguration('face_track_p_gain'),
+                'p_gain_pitch': LaunchConfiguration('face_track_p_gain_pitch'),
                 'show_annotations': LaunchConfiguration('show_annotations'),
-                'kalman_std_acc': LaunchConfiguration('kalman_std_acc'),
-                'kalman_std_meas': LaunchConfiguration('kalman_std_meas'),
             }],
         ),
 
@@ -202,6 +203,6 @@ def generate_launch_description():
             package='rqt_image_view',
             executable='rqt_image_view',
             name='rqt_image_view_tracked',
-            arguments=['/face_tracked/compressed'],
+            arguments=['/face_tracked', '_image_transport:=compressed'],
         ),
     ])

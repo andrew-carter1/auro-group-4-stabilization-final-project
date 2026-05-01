@@ -13,7 +13,7 @@ This is a ROS2-based autonomous robotics project with three loosely coupled syst
 
 ## Build & Run Commands
 
-### Software Stack (Stabilization + Face Detection)
+### Software Stack (Rolling Shutter + Yaw Stabilization + Face Detection DNN)
 
 ```bash
 cd software/ros2_stabilization_ws/
@@ -21,13 +21,11 @@ rosdep install --from-paths src --ignore-src -r -y
 colcon build
 source install/setup.bash
 
-# Run nodes
-ros2 run stabilization_pkg stabilization_node
-ros2 run stabilization_pkg realtime_stabilization
-ros2 run face_detection face_detection_node
+# Run with rolling shutter + yaw stabilization + DNN face detection
+ros2 launch stabilization_pkg demo_rs_yaw_launch.py
 
-# Or use the launch file (starts stabilization + face detection + rqt_image_view)
-ros2 launch stabilization_pkg stabilization_launch.py
+# Or clean version without annotations
+ros2 launch stabilization_pkg demo_rs_yaw_clean_launch.py
 ```
 
 ### Hardware Stack (Drone Control)
@@ -67,12 +65,13 @@ python3 gimbal_raw_reader.py  # reads roll/pitch/yaw from /dev/ttyACM0
 
 ### Software Workspace (`software/ros2_stabilization_ws/src/`)
 
-**stabilization_pkg** — main stabilization node:
-- `realtime_stabilization.py` — captures from USB webcam (V4L2 device 0, 320×240 @ 15fps MJPG), runs Lucas-Kanade optical flow + partial affine estimation, applies EMA smoothing (ALPHA=0.05) on cumulative trajectory, then publishes to `/stabilized_frame/compressed`. Also displays a side-by-side view with shake graph.
-- `stabilization_node.py` — legacy node that subscribes to `/image_raw` and publishes to `output/image`.
-- `launch/stabilization_launch.py` — starts stabilization_node, face_detection_node, and rqt_image_view.
-
-**face_detection** — subscribes to stabilized frames and runs Haar Cascade detection, publishes to `/image_with_faces/compressed`.
+**stabilization_pkg** — complete video stabilization and detection pipeline:
+- `rolling_shutter_node.py` — corrects rolling shutter distortion using compass gimbal data (or optical flow), applies per-row horizontal warp via cv2.remap().
+- `yaw_stabilizer.py` — applies yaw stabilization via EMA reference tracking + PD control, sliding crop window at 960×720 resolution.
+- `gimbal_node.py` — reads gimbal angles from Storm BCG board at 60 Hz via SimpleBGC Serial API, publishes to `/gimbal/angles`.
+- `face_detection_dnn_node.py` — DNN-based face detection (YOLO or similar), publishes detected faces.
+- `demo_comparison_node.py` — creates side-by-side and multi-panel comparison views for visualization.
+- Launch files: `demo_rs_yaw_launch.py` (annotated) and `demo_rs_yaw_clean_launch.py` (clean output).
 
 ### Hardware Workspace (`hardware/px4_ws/src/drone_control/`)
 
@@ -93,8 +92,10 @@ Serial interface to Storm BCG gimbal at `/dev/ttyACM0`, 115200 baud, SimpleBGC S
 
 | Name | Type | Direction |
 |---|---|---|
-| `/stabilized_frame/compressed` | CompressedImage | pub by stabilization_pkg |
-| `/image_with_faces/compressed` | CompressedImage | pub by face_detection |
+| `/gimbal/angles` | Vector3Stamped | pub by gimbal_node |
+| `/rs_corrected_frame/compressed` | CompressedImage | pub by rolling_shutter_node |
+| `/yaw_stabilized/compressed` | CompressedImage | pub by yaw_stabilizer |
+| `/demo_full_pipeline/compressed` | CompressedImage | pub by demo_comparison_node |
 | `/mavros/state` | mavros_msgs/State | sub by offboard_node |
 | `/mavros/setpoint_position/local` | PoseStamped | pub by offboard_node |
 | `/mavros/cmd/arming` | CommandBool (srv) | called by offboard_node |
@@ -117,7 +118,9 @@ See `Progress_Apr_8.md` for design rationale and planned improvements (IMU+visio
 
 ## Important Notes
 
-- The `stabilization_pkg/setup.py` has no `entry_points` yet — nodes are run directly with `ros2 run` using the installed scripts, or invoked manually.
+- Gimbal node runs at 60 Hz (configurable); yaw data fed to both rolling_shutter_node and yaw_stabilizer.
+- Rolling shutter correction: compass mode (gimbal-based) is preferred over optical_flow mode.
+- Yaw stabilization uses EMA reference tracking + PD control with weighted 3-frame dx averaging.
+- Launch files default `yaw_lag_frames=0`; can be increased for gimbal lag compensation.
 - PX4-Autopilot must be cloned separately into `hardware/` (not committed to this repo).
-- `software/hw.py` is a standalone (non-ROS2) face detection script for quick testing.
 - `examples/real_time_stabilization/` contains older algorithm prototypes for reference.

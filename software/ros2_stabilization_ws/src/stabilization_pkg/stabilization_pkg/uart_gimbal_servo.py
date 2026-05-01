@@ -41,6 +41,8 @@ class UartGimbalServoNode(Node):
 
         # ------ State ------
         self._latest_pitch_deg = 0.0
+        self._last_pitch_time = None
+        self._no_face_timeout = 2.0  # Reset to 0 if no face for 2 seconds
 
         # ------ Subscriptions ------
         self.create_subscription(Float32, '/face_tracker/pitch_cmd', self._pitch_cmd_cb, 10)
@@ -78,16 +80,20 @@ class UartGimbalServoNode(Node):
 
     def _deg_to_duty(self, deg: float) -> float:
         """Convert gimbal angle (degrees) to PWM duty cycle (0–100%)."""
+        # Invert pitch direction
+        deg = -deg
+
         # Clamp to valid range
         deg_clamped = max(self._min_deg, min(self._max_deg, deg))
 
-        # Inverted mapping: +45° (face below) → 0%, -45° (face above) → 100%
-        duty = ((self._max_deg - deg_clamped) / (self._max_deg - self._min_deg)) * 100.0
+        # Mapping: +40° (face above) → 100%, -40° (face below) → 0%
+        duty = ((deg_clamped - self._min_deg) / (self._max_deg - self._min_deg)) * 100.0
         return duty
 
     def _pitch_cmd_cb(self, msg: Float32):
         """Store latest pitch command (sent by timer at 10 Hz)."""
         self._latest_pitch_deg = msg.data
+        self._last_pitch_time = self.get_clock().now()
 
     def _send_timer_cb(self):
         """Send pitch command to ESP32 at 10 Hz."""
@@ -95,7 +101,17 @@ class UartGimbalServoNode(Node):
             if not self._connect():
                 return
 
-        duty = self._deg_to_duty(self._latest_pitch_deg)
+        # Slowly decay to 0 if no face detected for N seconds
+        pitch_to_send = self._latest_pitch_deg
+        if self._last_pitch_time is not None:
+            elapsed = (self.get_clock().now() - self._last_pitch_time).nanoseconds / 1e9
+            if elapsed > self._no_face_timeout:
+                # Exponential decay: 50% per second after timeout
+                decay_time = elapsed - self._no_face_timeout
+                decay_factor = 0.5 ** (decay_time / 1.0)
+                pitch_to_send = self._latest_pitch_deg * decay_factor
+
+        duty = self._deg_to_duty(pitch_to_send)
 
         # Send command
         try:

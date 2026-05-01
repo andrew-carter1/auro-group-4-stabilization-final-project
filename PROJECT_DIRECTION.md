@@ -120,20 +120,20 @@ David understood that gimbal firmware is locked — any solution must be **softw
 
 **Why impactful**: Directly addresses the "software yaw" idea; shows sensor fusion (class curriculum); bleeding-edge for a 2-axis gimbal.
 
-#### Option B: **Face Detection + Gimbal Tracking** (2–3 days, 2 people)
-**Goal**: Lock camera on detected face; command gimbal to keep face centered
+#### Option B: **Face Detection + Gimbal Tracking** ~~(2–3 days, 2 people)~~ **[DEPRECATED]**
+**Status**: Replaced with DNN-based face detection (more robust).
 
-**Steps**:
-1. Enhance existing `face_detection_node`
-2. Compute face center bounding box
-3. Map face position (pixels) to gimbal command angle offset:
-   - If face center offset left → increase roll to pan left
-   - If face center offset up → increase pitch to tilt up
-4. Add smooth ramp (P-controller): `angle_cmd = base_angle + K_p * center_error`
-5. **Deliverable**: Live demo — face moves, gimbal follows; no shake
-6. **Metric**: How many seconds until gimbal locks onto face; tracking smoothness
+**Original Goal**: Lock camera on detected face; command gimbal to keep face centered
 
-**Why impactful**: Combines computer vision + control (class topics); practical demo (impressive visually); natural progression from detection to tracking.
+**Former Steps**:
+1. ~~Enhance existing `face_detection_node`~~ (Haar Cascade)
+2. ~~Compute face center bounding box~~
+3. ~~Map face position to gimbal command angle offset~~
+4. ~~Add smooth ramp (P-controller)~~
+
+**Current Approach**: Using `face_detection_dnn_node.py` with deep neural networks for more reliable detection. Non-DNN gimbal tracking (face_tracker.py, kalman_face.py, uart_gimbal_servo.py) deprecated in favor of rolling shutter + yaw stabilization pipeline.
+
+**Why Changed**: DNN-based detection is more robust across lighting conditions and face angles. Focus shifted to gimbal stabilization (rolling shutter correction, yaw control) rather than face-following.
 
 #### Option C: **Rolling Shutter Reduction via Frame Alignment** (2–3 days, 2 people)
 **Goal**: Detect and compensate for rolling shutter artifacts during fast gimbal motion
